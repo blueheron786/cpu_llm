@@ -304,8 +304,6 @@ fn main() {
 
     // Process text in chunks to avoid storing the entire cleaned text
     const CHUNK_SIZE: usize = 1_000_000; // Process 1MB at a time
-    let mut token_freqs: HashMap<String, usize> = HashMap::new();
-    let mut word_freqs: HashMap<String, usize> = HashMap::new();
     
     println!("First pass: Counting frequencies in parallel chunks...");
     
@@ -384,7 +382,7 @@ fn main() {
     drop(token_freqs); // Free memory
 
     println!("Final vocab size: {} tokens", vocab.len());
-    let model = TinyRnnModel::new(vocab, CONTEXT_SIZE, HIDDEN_SIZE);
+    let mut model = TinyRnnModel::new(vocab, CONTEXT_SIZE, HIDDEN_SIZE);
 
     // Third pass: Convert text to IDs using parallel processing
     println!("Third pass: Converting to token IDs in parallel...");
