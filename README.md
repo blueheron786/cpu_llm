@@ -21,8 +21,10 @@ To retrain, simply add/remove files and run the training again.
 
 ## Architecture
 
-- `train.rs`: Entry point, runs training and generates the model using texts in `data`
+- `hybrid_train.rs`: Entry point, runs training and generates the model using texts in `data`. The hybrid training uses a hybrid tokenizer that uses a character and wordpiece (subword) approach.
 - `main.rs`: Entry point, runs inference (prompt -> response)
 - `model.rs`: It's the model (structure and weights)
 - `io.rs`: Model persistence (save/load weights)
+
+`train.rs` uses the old, character-based tokenizer. 
 
