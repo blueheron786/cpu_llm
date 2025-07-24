@@ -33,7 +33,7 @@ pub fn train(text: &str, output_path: &str) {
     let total_ram: u64 = sys.total_memory() * 1024;
     let target_ram: u64 = total_ram.saturating_sub(min_free_ram);
     let bytes_per_sample = (model.hidden_size * model.vocab_size * 4) + (model.vocab_size * 4) + 4; // grad_w + grad_b + loss
-    let mut batch_size = 1000; // Start small and adapt
+    let mut batch_size = 100_000; // Start high and adapt down
 
     for epoch in 0..epochs {
         let mut total_loss: f32 = 0.0;
@@ -45,16 +45,12 @@ pub fn train(text: &str, output_path: &str) {
             let free_ram = sys.free_memory() * 1024;
             let used_ram = sys.used_memory() * 1024;
             let max_batch = (target_ram / bytes_per_sample.max(1) as u64).max(1) as usize;
-            // If RAM is low, halve batch size
+            // If RAM is low, decrease batch size by 10%
             if free_ram < min_free_ram {
                 println!("⏸️ RAM usage high (free: {:.1}GB), pausing...", free_ram as f64 / 1e9);
-                batch_size = (batch_size / 2).max(1);
+                batch_size = ((batch_size as f64) * 0.9).max(1.0) as usize;
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 continue;
-            }
-            // If RAM is plentiful, double batch size (up to max)
-            if used_ram + (batch_size as u64) * (bytes_per_sample as u64) < target_ram && batch_size < max_batch {
-                batch_size = (batch_size * 2).min(max_batch).min(100_000);
             }
             batch_size = batch_size.min(max_batch).min(100_000).min(total - idx);
             let end = idx + batch_size;
