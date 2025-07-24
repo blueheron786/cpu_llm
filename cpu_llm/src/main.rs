@@ -1,4 +1,4 @@
-use cpu_llm::{model::{TinyRnnModel, run_inference}, io::load_model};
+use cpu_llm::{model::{run_inference}, io::load_model};
 
 fn main() {
     let model = load_model("model.json").expect("Failed to load model.");

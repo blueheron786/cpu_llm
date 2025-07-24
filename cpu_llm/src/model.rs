@@ -71,9 +71,8 @@ pub fn run_inference(prompt: &str, num_tokens: usize, model: &TinyRnnModel) -> S
     let itos = &model.itos;
 
     // Convert prompt chars to token IDs
-    let mut context: Vec<usize> = prompt
-        .chars()
-        .filter_map(|c| stoi.get(&c).copied())
+    let mut context: Vec<usize> = prompt.chars()
+        .filter_map(|c| model.vocab.iter().position(|&vc| vc == c))
         .collect();
 
     let mut output = prompt.to_string();

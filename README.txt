@@ -14,6 +14,10 @@ This is a rapidly-changing, highly experimental fun project. Feel free to open a
 - Run `cargo run --bin train` to generate the training model
 - Run `cargo run --bin main` to generate text based on a fixed prompt
 
+Add your training data files to `data` as plaintext. Feel free to organize it into subfolders as you see fit. Ensure the text files contain plain text, preferably representative of your target language or domain.
+
+To retrain, simply add/remove files and run the training again.
+
 ## Architecture
 
 - `train.rs`: Entry point, runs training and generates the model using texts in `data`

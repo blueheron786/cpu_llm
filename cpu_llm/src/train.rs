@@ -2,11 +2,16 @@ use cpu_llm::{model::TinyRnnModel, io::save_model};
 use glob::glob;
 use std::fs;
 
+const FIXED_VOCAB: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?'\n";
+
 pub fn train(text: &str, output_path: &str) {
     // Build vocab from text
-    let mut vocab: Vec<char> = text.chars().collect();
+    // let mut vocab: Vec<char> = text.chars().collect();
+    
+    // Used a fixed vocab for simplicity, and to avoid index-out-of-bounds errors
+    let mut vocab: Vec<char> = FIXED_VOCAB.chars().collect();
     vocab.sort();
-    vocab.dedup();
+    // Don't de-dupe, it removes lower-case variables.
 
     let model = TinyRnnModel::new(vocab);
 
