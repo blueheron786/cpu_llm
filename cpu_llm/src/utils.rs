@@ -1,6 +1,5 @@
 // src/utils.rs
 use rand::Rng;
-use rayon::prelude::*;
 
 /// Fully connected layer: output = weights * input + bias
 pub fn linear(input: &[f32], weights: &[Vec<f32>], bias: &[f32]) -> Vec<f32> {
@@ -32,7 +31,7 @@ pub fn softmax(vec: Vec<f32>) -> Vec<f32> {
 /// Sample index from a probability distribution
 pub fn sample(probs: &[f32]) -> usize {
     let mut rng = rand::thread_rng();
-    let mut r: f32 = rng.gen();
+    let r: f32 = rng.gen();
     let mut acc = 0.0;
     for (i, &p) in probs.iter().enumerate() {
         acc += p;

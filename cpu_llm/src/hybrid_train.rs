@@ -28,7 +28,7 @@ impl Token {
     }
 }
 
-// Clean text by normalizing spaces and lowercasing. Efficeintly. I hope.
+// Clean text by normalizing spaces and lowercasing. Efficiently.
 fn clean_text(text: &str) -> String {
     let mut cleaned = String::with_capacity(text.len());
     let mut prev_was_space = false;
@@ -121,13 +121,13 @@ struct TinyRnnModel {
 }
 
 impl TinyRnnModel {
-    fn new(vocab: Vec<String>, context_size: usize, hidden_size: usize) -> Self {
-        let vocab_size = vocab.len();
-        let mut stoi = HashMap::new();
-        for (i, w) in vocab.iter().enumerate() {
+    fn new(vocab_vec: Vec<String>, context_size: usize, hidden_size: usize) -> Self {
+        let vocab_size = vocab_vec.len();
+        let mut stoi = HashMap::with_capacity(vocab_size);
+        let itos = vocab_vec.clone();
+        for (i, w) in vocab_vec.iter().enumerate() {
             stoi.insert(w.clone(), i);
         }
-        let itos = vocab.clone();
 
         fn rand_matrix(rows: usize, cols: usize) -> Vec<Vec<f32>> {
             let mut rng = rand::thread_rng();
@@ -137,7 +137,7 @@ impl TinyRnnModel {
         }
 
         TinyRnnModel {
-            vocab,
+            vocab: vocab_vec,
             stoi,
             itos,
             context_size,
@@ -271,7 +271,6 @@ fn main() {
         let start = Instant::now();
         let mut total_loss = 0.0;
         let mut batch_count = 0;
-        let mut last_batch_time = 0.0;
         let total_batches = ((token_ids.len() - 1 - CONTEXT_SIZE) as f64 / BATCH_SIZE as f64).ceil() as usize;
 
         for idx in (CONTEXT_SIZE..token_ids.len() - 1).step_by(BATCH_SIZE) {
@@ -334,8 +333,7 @@ fn main() {
             batch_count += 1;
 
             let batch_duration = batch_start.elapsed().as_secs_f64();
-            last_batch_time = batch_duration;
-            let eta = last_batch_time * (total_batches - batch_count) as f64;
+            let eta = batch_duration * (total_batches - batch_count) as f64;
             
             println!(
                 "Batch {} of {}, loss {:.4}, ETA: {:.1}s",
