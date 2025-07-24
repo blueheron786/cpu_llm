@@ -17,7 +17,7 @@ pub fn train(text: &str, output_path: &str) {
     println!("Training vocabulary ({} chars): {:?}", vocab.len(), vocab);
     let mut model = TinyRnnModel::new(vocab);
 
-    let learning_rate = 0.01;
+    let learning_rate = 0.001;
     let epochs = 3;
     let context_size = model.context_size;
 
@@ -33,7 +33,7 @@ pub fn train(text: &str, output_path: &str) {
     let total_ram: u64 = sys.total_memory() * 1024;
     let target_ram: u64 = total_ram.saturating_sub(min_free_ram);
     let bytes_per_sample = (model.hidden_size * model.vocab_size * 4) + (model.vocab_size * 4) + 4; // grad_w + grad_b + loss
-    let mut batch_size = 100_000; // Start high and adapt down
+    let mut batch_size = 150_000; // Start high and adapt up/down
 
     for epoch in 0..epochs {
         let mut total_loss: f32 = 0.0;
@@ -48,7 +48,7 @@ pub fn train(text: &str, output_path: &str) {
             // If RAM is low, decrease batch size by 10%
             if free_ram < min_free_ram {
                 println!("⏸️ RAM usage high (free: {:.1}GB), pausing...", free_ram as f64 / 1e9);
-                batch_size = ((batch_size as f64) * 0.9).max(1.0) as usize;
+                batch_size = ((batch_size as f64) * 0.98).max(1.0) as usize;
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 continue;
             }
@@ -91,7 +91,8 @@ pub fn train(text: &str, output_path: &str) {
                         return (vec![vec![0.0; model.vocab_size]; model.hidden_size], vec![0.0; model.vocab_size], 0.0);
                     }
                     // Cross-entropy loss
-                    let loss = -probs[target_idx].ln();
+                    let safe_prob = probs[target_idx].max(1e-8);
+                    let loss = -safe_prob.ln();
                     // Gradient for output layer (softmax + cross-entropy)
                     let mut dlogits = probs.clone();
                     dlogits[target_idx] -= 1.0;
@@ -132,7 +133,10 @@ pub fn train(text: &str, output_path: &str) {
                 println!("Progress: {}/{} ({:.2}%) {}", idx, total, percent, eta);
             }
         }
-        println!("Epoch {}: avg loss = {}", epoch+1, total_loss/(text_len as f32));
+        let epoch_time = start.elapsed().as_secs_f64();
+        let epochs_left = epochs - (epoch + 1);
+        let eta_epochs = epoch_time * (epochs_left as f64);
+        println!("Epoch {}/{}: avg loss = {} | ETA: {:.1} min", epoch+1, epochs, total_loss/(text_len as f32), eta_epochs / 60.0);
     }
 
          match save_model(output_path, &model) {
