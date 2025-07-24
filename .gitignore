@@ -21,3 +21,5 @@ Cargo.lock
 
 ### Other stuff
 path.ps1
+# Your personal training data
+data/

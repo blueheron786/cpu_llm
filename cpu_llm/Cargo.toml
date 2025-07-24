@@ -1,8 +1,23 @@
 [package]
 name = "cpu_llm"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 rand = "0.8"
-rayon = "1.8"
+rayon = "1.5"
+glob = "0.3"
+
+[lib]
+name = "cpu_llm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "main"
+path = "src/main.rs"
+
+[[bin]]
+name = "train"
+path = "src/train.rs"
