@@ -134,7 +134,7 @@ fn run_inference(prompt: &str, num_tokens: usize) -> String {
 
 // ==== Main entry point ====
 fn main() {
-    let prompt = "the ";
+    let prompt = "It was a dark and stormy night. ";
     let generated = run_inference(prompt, 100);
     println!("Generated: {}", generated);
 }
