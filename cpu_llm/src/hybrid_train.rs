@@ -61,10 +61,29 @@ fn clean_text(text: &str) -> String {
 
 // Build word vocab for words with frequency >= min_freq
 fn build_word_vocab(text: &str, min_freq: usize) -> HashSet<String> {
-    let mut freq = HashMap::new();
-    for word in text.split_whitespace() {
-        *freq.entry(word.to_string()).or_insert(0) += 1;
-    }
+    // Split text into chunks for parallel processing
+    let chunks: Vec<&str> = text.split_whitespace().collect();
+    
+    // Process chunks in parallel to count frequencies
+    let freq = chunks.par_iter()
+        .fold(
+            || HashMap::new(),
+            |mut acc, word| {
+                *acc.entry((*word).to_string()).or_insert(0) += 1;
+                acc
+            }
+        )
+        .reduce(
+            || HashMap::new(),
+            |mut map1, map2| {
+                for (word, count) in map2 {
+                    *map1.entry(word).or_insert(0) += count;
+                }
+                map1
+            }
+        );
+
+    // Filter words meeting minimum frequency
     freq.into_iter()
         .filter(|(_, c)| *c >= min_freq)
         .map(|(w, _)| w)
@@ -229,10 +248,9 @@ fn main() {
     let tokens = hybrid_tokenize(&clean, &word_vocab);
 
     println!("Building token vocab...");
-    let mut vocab_set = HashSet::new();
-    for t in &tokens {
-        vocab_set.insert(t.as_str());
-    }
+    let vocab_set: HashSet<String> = tokens.par_iter()
+        .map(|t| t.as_str())
+        .collect();
     let mut vocab: Vec<String> = vocab_set.into_iter().collect();
     vocab.sort();
 
@@ -253,8 +271,11 @@ fn main() {
         let start = Instant::now();
         let mut total_loss = 0.0;
         let mut batch_count = 0;
+        let mut last_batch_time = 0.0;
+        let total_batches = ((token_ids.len() - 1 - CONTEXT_SIZE) as f64 / BATCH_SIZE as f64).ceil() as usize;
 
         for idx in (CONTEXT_SIZE..token_ids.len() - 1).step_by(BATCH_SIZE) {
+            let batch_start = Instant::now();
             let end = (idx + BATCH_SIZE).min(token_ids.len() - 1);
 
             // Parallel batch processing
@@ -312,13 +333,17 @@ fn main() {
             total_loss += loss_sum;
             batch_count += 1;
 
-            if batch_count % 10 == 0 {
-                println!(
-                    "   🌀 Batch {} loss {:.4}",
-                    batch_count,
-                    loss_sum / (end - idx) as f32
-                );
-            }
+            let batch_duration = batch_start.elapsed().as_secs_f64();
+            last_batch_time = batch_duration;
+            let eta = last_batch_time * (total_batches - batch_count) as f64;
+            
+            println!(
+                "Batch {} of {}, loss {:.4}, ETA: {:.1}s",
+                batch_count,
+                total_batches,
+                loss_sum / (end - idx) as f32,
+                eta
+            );
         }
 
         let elapsed = start.elapsed().as_secs_f64();
