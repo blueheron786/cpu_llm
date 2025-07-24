@@ -28,12 +28,36 @@ impl Token {
     }
 }
 
-// Clean text by normalizing spaces and lowercasing
+// Clean text by normalizing spaces and lowercasing. Efficeintly. I hope.
 fn clean_text(text: &str) -> String {
-    let s = text.replace('\n', " ").replace('\r', " ");
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    s.to_lowercase()
+    let mut cleaned = String::with_capacity(text.len());
+    let mut prev_was_space = false;
+
+    for c in text.chars() {
+        let c = match c {
+            '\n' | '\r' => ' ',
+            _ => c.to_ascii_lowercase(),
+        };
+
+        if c.is_whitespace() {
+            if !prev_was_space {
+                cleaned.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            cleaned.push(c);
+            prev_was_space = false;
+        }
+    }
+
+    // Trim trailing space if any
+    if cleaned.ends_with(' ') {
+        cleaned.pop();
+    }
+
+    cleaned
 }
+
 
 // Build word vocab for words with frequency >= min_freq
 fn build_word_vocab(text: &str, min_freq: usize) -> HashSet<String> {
@@ -199,7 +223,7 @@ fn main() {
     let clean = clean_text(&combined_text);
 
     println!("Building word vocab...");
-    let word_vocab = build_word_vocab(&clean, 3);
+    let word_vocab = build_word_vocab(&clean, 15);
 
     println!("Tokenizing hybrid...");
     let tokens = hybrid_tokenize(&clean, &word_vocab);
@@ -282,6 +306,8 @@ fn main() {
                         (acc_w, acc_b, acc_loss + loss)
                     },
                 );
+
+            model.update_weights(&grad_w_sum, &grad_b_sum, LR, end - idx);
 
             total_loss += loss_sum;
             batch_count += 1;

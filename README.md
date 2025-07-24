@@ -1,6 +1,6 @@
 # CPU LLM
 
-## :warning: Highly experimental :warning
+## :warning: Highly experimental :warning:
 
 LLM built from the ground-up to use CPUs (multiple threads) and CPU RAM instead of GPUs and GPU RAM.
 
