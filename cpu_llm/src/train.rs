@@ -1,3 +1,8 @@
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Training using characters as tokens. No longer used, in favour of hybrid training (sub-token level).
+// This file is kept for reference and historical context.
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 use cpu_llm::{model::TinyRnnModel, io::save_model};
 use glob::glob;
 use rayon::prelude::*;
@@ -46,10 +51,12 @@ pub fn train(text: &str, output_path: &str) {
     let lr = 0.05;
 
     let mut model = model;
+    use std::time::Instant;
     for epoch in 0..epochs {
         println!("🚀 Epoch {}/{}", epoch + 1, epochs);
         let mut total_loss = 0.0;
         let mut batch_count = 0;
+        let epoch_start = Instant::now();
 
         for idx in (context_size..text_chars.len() - 1).step_by(batch_size) {
             let end = (idx + batch_size).min(text_chars.len() - 1);
@@ -146,7 +153,10 @@ pub fn train(text: &str, output_path: &str) {
             }
         }
 
-        println!("✅ Epoch complete. Avg loss = {:.4}", total_loss / (batch_count as f32 * batch_size as f32));
+        let epoch_time = epoch_start.elapsed().as_secs_f64();
+        let epochs_left = epochs - (epoch + 1);
+        let eta_epochs = epoch_time * (epochs_left as f64);
+        println!("✅ Epoch complete. Avg loss = {:.4} | ETA: {:.1} min", total_loss / (batch_count as f32 * batch_size as f32), eta_epochs / 60.0);
     }
 
     match save_model(output_path, &model) {

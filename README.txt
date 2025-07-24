@@ -10,6 +10,7 @@ This is a rapidly-changing, highly experimental fun project. Feel free to open a
 
 ## Usage
 
+- Download TinyStories v2 (training data) and put it in `cpu_llm/data`
 - Drop a bunch of text files into the `data` directory
 - Run `cargo run --release --bin train` to generate the training model using maximum efficiency.
 - Run `cargo run --bin main` to generate text based on a fixed prompt

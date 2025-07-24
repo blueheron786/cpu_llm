@@ -22,4 +22,4 @@ path = "src/main.rs"
 
 [[bin]]
 name = "train"
-path = "src/train.rs"
+path = "src/hybrid_train.rs"
