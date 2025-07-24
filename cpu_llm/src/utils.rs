@@ -4,13 +4,16 @@ use rayon::prelude::*;
 
 /// Fully connected layer: output = weights * input + bias
 pub fn linear(input: &[f32], weights: &[Vec<f32>], bias: &[f32]) -> Vec<f32> {
-    weights
-        .par_iter()
-        .enumerate()
-        .map(|(i, row)| {
-            row.iter().zip(input.iter()).map(|(w, x)| w * x).sum::<f32>() + bias[i]
-        })
-        .collect()
+    let mut out = Vec::with_capacity(weights.len());
+    for (i, row) in weights.iter().enumerate() {
+        if i >= bias.len() { break; }
+        let mut sum = 0.0;
+        for (w, x) in row.iter().zip(input.iter()) {
+            sum += w * x;
+        }
+        out.push(sum + bias[i]);
+    }
+    out
 }
 
 /// ReLU activation function
@@ -30,11 +33,17 @@ pub fn softmax(vec: Vec<f32>) -> Vec<f32> {
 pub fn sample(probs: &[f32]) -> usize {
     let mut rng = rand::thread_rng();
     let mut r: f32 = rng.gen();
+    let mut acc = 0.0;
     for (i, &p) in probs.iter().enumerate() {
-        r -= p;
-        if r <= 0.0 {
+        acc += p;
+        if r < acc {
             return i;
         }
     }
-    probs.len() - 1
+    // If not found due to rounding, return last valid index
+    if !probs.is_empty() {
+        probs.len() - 1
+    } else {
+        0
+    }
 }

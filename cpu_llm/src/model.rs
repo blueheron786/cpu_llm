@@ -27,7 +27,7 @@ impl TinyRnnModel {
     pub fn new(vocab: Vec<char>) -> Self {
         let vocab_size = vocab.len();
         let context_size = 16;
-        let hidden_size = 32;
+        let hidden_size = 128; // Increase hidden size for more capacity
 
         // Build stoi and itos
         let mut stoi = HashMap::new();

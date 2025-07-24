@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+glob = "0.3"
+num_cpus = "1.13"
 rand = "0.8"
 rayon = "1.5"
-glob = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sysinfo = "0.29"
 
 [lib]
 name = "cpu_llm"
