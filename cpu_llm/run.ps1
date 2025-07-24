@@ -1,0 +1,1 @@
+cargo run --release --bin train

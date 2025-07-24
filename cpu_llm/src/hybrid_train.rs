@@ -248,9 +248,24 @@ fn main() {
     let tokens = hybrid_tokenize(&clean, &word_vocab);
 
     println!("Building token vocab...");
-    let vocab_set: HashSet<String> = tokens.par_iter()
-        .map(|t| t.as_str())
-        .collect();
+    let mut vocab_set: HashSet<String> = HashSet::new();
+    const CHUNK_SIZE: usize = 10000;
+
+    // Process tokens in chunks to build vocab. Stays memory efficient.
+    for chunk_start in (0..tokens.len()).step_by(CHUNK_SIZE) {
+        let chunk_end = (chunk_start + CHUNK_SIZE).min(tokens.len());
+        let chunk = &tokens[chunk_start..chunk_end];
+        
+        // Process chunk and add to vocab
+        chunk.iter().for_each(|t| {
+            vocab_set.insert(t.as_str());
+        });
+
+        if chunk_start % (CHUNK_SIZE * 10) == 0 {
+            println!("Processed {}/{} tokens for vocab", chunk_start + CHUNK_SIZE, tokens.len());
+        }
+    }
+
     let mut vocab: Vec<String> = vocab_set.into_iter().collect();
     vocab.sort();
 
