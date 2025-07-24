@@ -9,8 +9,8 @@ use std::time::Instant;
 const CONTEXT_SIZE: usize = 8;
 const HIDDEN_SIZE: usize = 64;
 const EPOCHS: usize = 5;
-const BATCH_SIZE: usize = 256;
-const LR: f32 = 0.05;
+const BATCH_SIZE: usize = 4096;  // Increased batch size for faster training
+const LR: f32 = 0.01;  // Slightly reduced learning rate for larger batches
 
 // Hybrid tokenizer tokens: either full word or char fallback
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -150,20 +150,35 @@ impl TinyRnnModel {
         }
     }
 
-    // Forward pass for one context (token IDs)
-    fn forward(&self, context: &[usize]) -> (Vec<f32>, Vec<f32>) {
-        let mut avg_embed = vec![0.0; self.hidden_size];
+    // Forward pass for one context (token IDs) with buffer reuse
+    fn forward_buffered(&self, context: &[usize], h_out: &mut [f32], logits_out: &mut [f32]) {
+        // Reuse h_out as embedding buffer
+        h_out.fill(0.0);
         for &id in context {
             for i in 0..self.hidden_size {
-                avg_embed[i] += self.embedding[id][i];
+                h_out[i] += self.embedding[id][i];
             }
         }
+        let context_size = context.len() as f32;
         for i in 0..self.hidden_size {
-            avg_embed[i] /= context.len() as f32;
+            h_out[i] /= context_size;
         }
 
-        let h = relu(&linear(&avg_embed, &self.ff1_weights, &self.ff1_bias));
-        let logits = linear(&h, &self.ff2_weights, &self.ff2_bias);
+        // In-place ReLU after linear
+        linear_inplace(h_out, &self.ff1_weights, &self.ff1_bias, logits_out);
+        for x in h_out.iter_mut() {
+            *x = x.max(0.0);
+        }
+
+        // Final linear layer
+        linear_inplace(h_out, &self.ff2_weights, &self.ff2_bias, logits_out);
+    }
+
+    // Keep the original forward for compatibility
+    fn forward(&self, context: &[usize]) -> (Vec<f32>, Vec<f32>) {
+        let mut h = vec![0.0; self.hidden_size];
+        let mut logits = vec![0.0; self.vocab.len()];
+        self.forward_buffered(context, &mut h, &mut logits);
         (h, logits)
     }
 
@@ -190,23 +205,47 @@ fn relu(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| v.max(0.0)).collect()
 }
 
-fn linear(input: &[f32], weights: &[Vec<f32>], bias: &[f32]) -> Vec<f32> {
-    let mut output = vec![0.0; bias.len()];
-    for (i, row) in weights.iter().enumerate() {
-        for (j, &w) in row.iter().enumerate() {
-            output[j] += input[i] * w;
+// Optimized in-place linear operation
+fn linear_inplace(input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
+    output.copy_from_slice(bias);
+    for (i, &x) in input.iter().enumerate() {
+        let row = &weights[i];
+        for (out, &w) in output.iter_mut().zip(row.iter()) {
+            *out += x * w;
         }
     }
-    for (o, b) in output.iter_mut().zip(bias.iter()) {
-        *o += *b;
-    }
+}
+
+// Original linear for compatibility
+fn linear(input: &[f32], weights: &[Vec<f32>], bias: &[f32]) -> Vec<f32> {
+    let mut output = vec![0.0; bias.len()];
+    linear_inplace(input, weights, bias, &mut output);
     output
 }
 
+// In-place softmax operation
+fn softmax_inplace(logits: &mut [f32], output: &mut [f32]) {
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0;
+    
+    // Compute exp in-place
+    for (i, &l) in logits.iter().enumerate() {
+        let exp_val = (l - max_logit).exp();
+        output[i] = exp_val;
+        sum += exp_val;
+    }
+    
+    // Normalize in-place
+    let sum = sum.max(1e-8);
+    output.iter_mut().for_each(|x| *x /= sum);
+}
+
+// Original softmax for compatibility
 fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum: f32 = logits.iter().map(|l| (*l - max_logit).exp()).sum();
-    logits.iter().map(|l| (*l - max_logit).exp() / exp_sum.max(1e-8)).collect()
+    let mut output = vec![0.0; logits.len()];
+    let mut logits = logits.to_vec();
+    softmax_inplace(&mut logits, &mut output);
+    output
 }
 
 fn main() {
@@ -244,40 +283,51 @@ fn main() {
     println!("Building word vocab...");
     let word_vocab = build_word_vocab(&clean, 15);
 
-    println!("Tokenizing hybrid...");
-    let tokens = hybrid_tokenize(&clean, &word_vocab);
-
-    println!("Building token vocab...");
-    let mut vocab_set: HashSet<String> = HashSet::new();
-    const CHUNK_SIZE: usize = 10000;
-
-    // Process tokens in chunks to build vocab. Stays memory efficient.
-    for chunk_start in (0..tokens.len()).step_by(CHUNK_SIZE) {
-        let chunk_end = (chunk_start + CHUNK_SIZE).min(tokens.len());
-        let chunk = &tokens[chunk_start..chunk_end];
-        
-        // Process chunk and add to vocab
-        chunk.iter().for_each(|t| {
-            vocab_set.insert(t.as_str());
-        });
-
-        if chunk_start % (CHUNK_SIZE * 10) == 0 {
-            println!("Processed {}/{} tokens for vocab", chunk_start + CHUNK_SIZE, tokens.len());
+    println!("First pass: Building vocab...");
+    let mut token_freqs: HashMap<String, usize> = HashMap::new();
+    
+    // First pass: Count token frequencies
+    for word in clean.split_whitespace() {
+        if word_vocab.contains(word) {
+            *token_freqs.entry(word.to_string()).or_insert(0) += 1;
+        } else {
+            for ch in word.chars() {
+                *token_freqs.entry(ch.to_string()).or_insert(0) += 1;
+            }
         }
     }
 
-    let mut vocab: Vec<String> = vocab_set.into_iter().collect();
+    // Build vocab from frequent tokens
+    let min_freq = 2; // Only keep tokens that appear at least twice
+    let mut vocab: Vec<String> = token_freqs
+        .into_iter()
+        .filter(|(_, freq)| *freq >= min_freq)
+        .map(|(token, _)| token)
+        .collect();
     vocab.sort();
 
-    println!("Vocab size: {}", vocab.len());
+    println!("Vocab size: {} tokens", vocab.len());
 
-    let mut model = TinyRnnModel::new(vocab.clone(), CONTEXT_SIZE, HIDDEN_SIZE);
+    let model = TinyRnnModel::new(vocab.clone(), CONTEXT_SIZE, HIDDEN_SIZE);
 
-    // Convert tokens to IDs
-    let token_ids: Vec<usize> = tokens
-        .iter()
-        .filter_map(|t| model.stoi.get(&t.as_str()).copied())
-        .collect();
+    // Second pass: Convert tokens directly to IDs without storing intermediate tokens
+    println!("Second pass: Converting text to token IDs...");
+    let mut token_ids = Vec::new();
+    token_ids.reserve(clean.split_whitespace().count() * 2); // Rough estimate
+
+    for word in clean.split_whitespace() {
+        if word_vocab.contains(word) {
+            if let Some(&id) = model.stoi.get(word) {
+                token_ids.push(id);
+            }
+        } else {
+            for ch in word.chars() {
+                if let Some(&id) = model.stoi.get(&ch.to_string()) {
+                    token_ids.push(id);
+                }
+            }
+        }
+    }
 
     println!("Training for {} epochs...", EPOCHS);
 
@@ -288,37 +338,50 @@ fn main() {
         let mut batch_count = 0;
         let total_batches = ((token_ids.len() - 1 - CONTEXT_SIZE) as f64 / BATCH_SIZE as f64).ceil() as usize;
 
+        // Pre-allocate thread-local buffers to avoid repeated allocations
+        let chunk_size = BATCH_SIZE / rayon::current_num_threads().max(1);
+        
         for idx in (CONTEXT_SIZE..token_ids.len() - 1).step_by(BATCH_SIZE) {
             let batch_start = Instant::now();
             let end = (idx + BATCH_SIZE).min(token_ids.len() - 1);
 
-            // Parallel batch processing
-            let (grad_w_sum, grad_b_sum, loss_sum) = (idx..end)
-                .into_par_iter()
-                .map(|i| {
+            // Process multiple samples per thread using chunked iteration
+            let (grad_w_sum, grad_b_sum, loss_sum) = (idx..end).into_par_iter()
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    // Thread-local buffers allocated once per chunk
                     let mut grad_w = vec![vec![0.0; model.vocab.len()]; model.hidden_size];
                     let mut grad_b = vec![0.0; model.vocab.len()];
                     let mut loss = 0.0_f32;
+                    let mut h_buffer = vec![0.0; model.hidden_size];
+                    let mut logits_buffer = vec![0.0; model.vocab.len()];
+                    let mut probs_buffer = vec![0.0; model.vocab.len()];
 
-                    let context = &token_ids[i - CONTEXT_SIZE..i];
-                    let target = token_ids[i];
+                    // Process multiple samples in this thread
+                    for i in chunk {
+                        let context = &token_ids[i - CONTEXT_SIZE..i];
+                        let target = token_ids[i];
 
-                    let (h, logits) = model.forward(context);
-                    let probs = softmax(&logits);
+                        // Reuse buffers for forward pass
+                        model.forward_buffered(context, &mut h_buffer, &mut logits_buffer);
+                        softmax_inplace(&mut logits_buffer, &mut probs_buffer);
 
-                    let safe_prob = probs[target].max(1e-8);
-                    loss += -safe_prob.ln();
+                        let safe_prob = probs_buffer[target].max(1e-8);
+                        loss += -safe_prob.ln();
 
-                    let mut dlogits = probs.clone();
-                    dlogits[target] -= 1.0;
-
-                    for j in 0..model.hidden_size {
-                        for k in 0..model.vocab.len() {
-                            grad_w[j][k] += dlogits[k] * h[j];
+                        // Compute gradients in-place
+                        probs_buffer[target] -= 1.0;
+                        
+                        // Optimized gradient accumulation
+                        for j in 0..model.hidden_size {
+                            let h_j = h_buffer[j];
+                            let grad_w_j = &mut grad_w[j];
+                            for (k, &dl_k) in probs_buffer.iter().enumerate() {
+                                grad_w_j[k] += dl_k * h_j;
+                            }
                         }
-                    }
-                    for k in 0..model.vocab.len() {
-                        grad_b[k] += dlogits[k];
+                        grad_b.iter_mut().zip(probs_buffer.iter())
+                            .for_each(|(gb, &dl)| *gb += dl);
                     }
 
                     (grad_w, grad_b, loss)
@@ -330,14 +393,14 @@ fn main() {
                         0.0_f32,
                     ),
                     |(mut acc_w, mut acc_b, acc_loss), (grad_w, grad_b, loss)| {
-                        for j in 0..model.hidden_size {
-                            for k in 0..model.vocab.len() {
-                                acc_w[j][k] += grad_w[j][k];
-                            }
-                        }
-                        for k in 0..model.vocab.len() {
-                            acc_b[k] += grad_b[k];
-                        }
+                        // Optimized gradient reduction
+                        acc_w.iter_mut().zip(grad_w.iter())
+                            .for_each(|(acc_row, grad_row)| {
+                                acc_row.iter_mut().zip(grad_row.iter())
+                                    .for_each(|(acc, &grad)| *acc += grad);
+                            });
+                        acc_b.iter_mut().zip(grad_b.iter())
+                            .for_each(|(acc, &grad)| *acc += grad);
                         (acc_w, acc_b, acc_loss + loss)
                     },
                 );
@@ -347,16 +410,20 @@ fn main() {
             total_loss += loss_sum;
             batch_count += 1;
 
-            let batch_duration = batch_start.elapsed().as_secs_f64();
-            let eta = batch_duration * (total_batches - batch_count) as f64;
-            
-            println!(
-                "Batch {} of {}, loss {:.4}, ETA: {:.1}s",
-                batch_count,
-                total_batches,
-                loss_sum / (end - idx) as f32,
-                eta
-            );
+            // Print progress less frequently
+            if batch_count % 10 == 0 || batch_count == 1 {
+                let batch_duration = batch_start.elapsed().as_secs_f64();
+                let eta = batch_duration * (total_batches - batch_count) as f64;
+                
+                println!(
+                    "Batch {}/{} ({:.1}%), loss {:.4}, ETA: {:.1}m",
+                    batch_count,
+                    total_batches,
+                    (batch_count as f32 / total_batches as f32) * 100.0,
+                    loss_sum / (end - idx) as f32,
+                    eta / 60.0
+                );
+            }
         }
 
         let elapsed = start.elapsed().as_secs_f64();
