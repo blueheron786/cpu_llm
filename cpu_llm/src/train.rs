@@ -28,11 +28,13 @@ pub fn train(text: &str, output_path: &str) {
     use sysinfo::{System, SystemExt};
     use std::time::Instant;
     let mut sys = System::new_all();
-    // RAM limiting: leave at least 2GB free, or use at most 50% of total RAM (whichever is more restrictive)
+    // RAM limiting: leave at least 2GB free
     let min_free_ram: u64 = 2 * 1024 * 1024 * 1024; // 2GB
-    let ram_cap: u64 = sys.total_memory() * 1024 / 2; // half total RAM (sysinfo returns KB)
+    let total_ram: u64 = sys.total_memory() * 1024;
+    let target_ram: u64 = total_ram.saturating_sub(min_free_ram);
+    let bytes_per_sample = (model.hidden_size * model.vocab_size * 4) + (model.vocab_size * 4) + 4; // grad_w + grad_b + loss
+    let mut batch_size = 1000; // Start small and adapt
 
-    let batch_size = 1000;
     for epoch in 0..epochs {
         let mut total_loss: f32 = 0.0;
         let start = Instant::now();
@@ -40,21 +42,22 @@ pub fn train(text: &str, output_path: &str) {
         let mut idx = 0;
         while idx < total {
             sys.refresh_memory();
-            let used_ram = sys.used_memory() * 1024;
             let free_ram = sys.free_memory() * 1024;
-            // Only proceed if both conditions are satisfied
-            while used_ram > ram_cap || free_ram < min_free_ram {
-                println!("⏸️ RAM usage high (used: {:.1}GB, free: {:.1}GB), pausing...", used_ram as f64 / 1e9, free_ram as f64 / 1e9);
+            let used_ram = sys.used_memory() * 1024;
+            let max_batch = (target_ram / bytes_per_sample.max(1) as u64).max(1) as usize;
+            // If RAM is low, halve batch size
+            if free_ram < min_free_ram {
+                println!("⏸️ RAM usage high (free: {:.1}GB), pausing...", free_ram as f64 / 1e9);
+                batch_size = (batch_size / 2).max(1);
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                sys.refresh_memory();
-                let used_ram = sys.used_memory() * 1024;
-                let free_ram = sys.free_memory() * 1024;
-                // Loop until RAM is safe
-                if used_ram <= ram_cap && free_ram >= min_free_ram {
-                    break;
-                }
+                continue;
             }
-            let end = (idx + batch_size).min(total);
+            // If RAM is plentiful, double batch size (up to max)
+            if used_ram + (batch_size as u64) * (bytes_per_sample as u64) < target_ram && batch_size < max_batch {
+                batch_size = (batch_size * 2).min(max_batch).min(100_000);
+            }
+            batch_size = batch_size.min(max_batch).min(100_000).min(total - idx);
+            let end = idx + batch_size;
             let batch_indices: Vec<usize> = (context_size + idx..context_size + end).collect();
             let grads: Vec<(Vec<Vec<f32>>, Vec<f32>, f32)> = batch_indices
                 .into_iter()

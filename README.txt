@@ -11,7 +11,7 @@ This is a rapidly-changing, highly experimental fun project. Feel free to open a
 ## Usage
 
 - Drop a bunch of text files into the `data` directory
-- Run `cargo run --bin train` to generate the training model
+- Run `cargo run --release --bin train` to generate the training model using maximum efficiency.
 - Run `cargo run --bin main` to generate text based on a fixed prompt
 
 Add your training data files to `data` as plaintext. Feel free to organize it into subfolders as you see fit. Ensure the text files contain plain text, preferably representative of your target language or domain.
