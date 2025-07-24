@@ -150,28 +150,21 @@ impl TinyRnnModel {
         }
     }
 
-    // Forward pass for one context (token IDs) with buffer reuse
+    // Forward pass for one context (token IDs) with buffer reuse and parallel processing
     fn forward_buffered(&self, context: &[usize], h_out: &mut [f32], logits_out: &mut [f32]) {
-        // Reuse h_out as embedding buffer
-        h_out.fill(0.0);
-        for &id in context {
-            for i in 0..self.hidden_size {
-                h_out[i] += self.embedding[id][i];
-            }
-        }
-        let context_size = context.len() as f32;
-        for i in 0..self.hidden_size {
-            h_out[i] /= context_size;
-        }
+        // Parallel embedding lookup and averaging
+        h_out.par_iter_mut().enumerate().for_each(|(i, h)| {
+            *h = context.iter()
+                .map(|&id| self.embedding[id][i])
+                .sum::<f32>() / context.len() as f32;
+        });
 
-        // In-place ReLU after linear
-        linear_inplace(h_out, &self.ff1_weights, &self.ff1_bias, logits_out);
-        for x in h_out.iter_mut() {
-            *x = x.max(0.0);
-        }
+        // Parallel linear + ReLU
+        linear_inplace_parallel(h_out, &self.ff1_weights, &self.ff1_bias, logits_out);
+        h_out.par_iter_mut().for_each(|x| *x = x.max(0.0));
 
-        // Final linear layer
-        linear_inplace(h_out, &self.ff2_weights, &self.ff2_bias, logits_out);
+        // Parallel final linear layer
+        linear_inplace_parallel(h_out, &self.ff2_weights, &self.ff2_bias, logits_out);
     }
 
     // Keep the original forward for compatibility
@@ -190,14 +183,25 @@ impl TinyRnnModel {
         lr: f32,
         batch_size: usize,
     ) {
-        for j in 0..self.hidden_size {
-            for k in 0..self.vocab.len() {
-                self.ff2_weights[j][k] -= lr * grad_w[j][k] / batch_size as f32;
-            }
-        }
-        for k in 0..self.vocab.len() {
-            self.ff2_bias[k] -= lr * grad_b[k] / batch_size as f32;
-        }
+        let scale = lr / batch_size as f32;
+        
+        // Parallel weight updates
+        self.ff2_weights.par_iter_mut()
+            .zip(grad_w.par_iter())
+            .for_each(|(weights_row, grad_row)| {
+                weights_row.par_iter_mut()
+                    .zip(grad_row.par_iter())
+                    .for_each(|(w, &g)| {
+                        *w -= scale * g;
+                    });
+            });
+
+        // Parallel bias updates
+        self.ff2_bias.par_iter_mut()
+            .zip(grad_b.par_iter())
+            .for_each(|(b, &g)| {
+                *b -= scale * g;
+            });
     }
 }
 
@@ -205,8 +209,29 @@ fn relu(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| v.max(0.0)).collect()
 }
 
-// Optimized in-place linear operation
+// Parallel in-place linear operation
+fn linear_inplace_parallel(input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
+    output.copy_from_slice(bias);
+    
+    // Split the output into chunks for parallel processing
+    let chunk_size = (output.len() + rayon::current_num_threads() - 1) / rayon::current_num_threads();
+    output.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
+        let start_idx = chunk_idx * chunk_size;
+        for (i, &x) in input.iter().enumerate() {
+            let row = &weights[i][start_idx..start_idx + out_chunk.len()];
+            for (out, &w) in out_chunk.iter_mut().zip(row.iter()) {
+                *out += x * w;
+            }
+        }
+    });
+}
+
+// Original in-place linear operation for smaller matrices
 fn linear_inplace(input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
+    if output.len() >= 1024 { // Use parallel version for larger matrices
+        linear_inplace_parallel(input, weights, bias, output);
+        return;
+    }
     output.copy_from_slice(bias);
     for (i, &x) in input.iter().enumerate() {
         let row = &weights[i];
@@ -277,57 +302,118 @@ fn main() {
         combined_text.len()
     );
 
-    println!("Cleaning text...");
-    let clean = clean_text(&combined_text);
-
-    println!("Building word vocab...");
-    let word_vocab = build_word_vocab(&clean, 15);
-
-    println!("First pass: Building vocab...");
+    // Process text in chunks to avoid storing the entire cleaned text
+    const CHUNK_SIZE: usize = 1_000_000; // Process 1MB at a time
     let mut token_freqs: HashMap<String, usize> = HashMap::new();
+    let mut word_freqs: HashMap<String, usize> = HashMap::new();
     
-    // First pass: Count token frequencies
-    for word in clean.split_whitespace() {
-        if word_vocab.contains(word) {
-            *token_freqs.entry(word.to_string()).or_insert(0) += 1;
-        } else {
-            for ch in word.chars() {
-                *token_freqs.entry(ch.to_string()).or_insert(0) += 1;
+    println!("First pass: Counting frequencies in parallel chunks...");
+    
+    // Create chunk ranges for parallel processing
+    let chunk_ranges: Vec<_> = (0..combined_text.len())
+        .step_by(CHUNK_SIZE)
+        .map(|start| start..((start + CHUNK_SIZE).min(combined_text.len())))
+        .collect();
+    
+    // Process chunks in parallel to count word frequencies
+    let word_freqs = chunk_ranges.par_iter()
+        .fold(
+            || HashMap::new(),
+            |mut freq_map, range| {
+                let chunk = &combined_text[range.clone()];
+                for word in clean_text(chunk).split_whitespace() {
+                    *freq_map.entry(word.to_string()).or_insert(0) += 1;
+                }
+                freq_map
             }
-        }
-    }
+        )
+        .reduce(
+            || HashMap::new(),
+            |mut map1, map2| {
+                for (word, count) in map2 {
+                    *map1.entry(word).or_insert(0) += count;
+                }
+                map1
+            }
+        );
 
-    // Build vocab from frequent tokens
-    let min_freq = 2; // Only keep tokens that appear at least twice
-    let mut vocab: Vec<String> = token_freqs
-        .into_iter()
-        .filter(|(_, freq)| *freq >= min_freq)
-        .map(|(token, _)| token)
+    // Build word vocabulary from frequent words
+    let word_vocab: HashSet<String> = word_freqs.into_par_iter()
+        .filter(|(_, freq)| *freq >= 15)
+        .map(|(word, _)| word)
+        .collect();
+    
+    println!("Word vocab size: {} words", word_vocab.len());
+
+    // Second pass: count token frequencies in parallel
+    println!("Second pass: Building token frequencies in parallel...");
+    let token_freqs = chunk_ranges.par_iter()
+        .fold(
+            || HashMap::new(),
+            |mut freq_map, range| {
+                let chunk = &combined_text[range.clone()];
+                for word in clean_text(chunk).split_whitespace() {
+                    if word_vocab.contains(word) {
+                        *freq_map.entry(word.to_string()).or_insert(0) += 1;
+                    } else {
+                        for ch in word.chars() {
+                            *freq_map.entry(ch.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                freq_map
+            }
+        )
+        .reduce(
+            || HashMap::new(),
+            |mut map1, map2| {
+                for (token, count) in map2 {
+                    *map1.entry(token).or_insert(0) += count;
+                }
+                map1
+            }
+        );
+
+    // Build final vocabulary
+    let min_token_freq = 5; // Increased threshold to reduce vocab size
+    let mut vocab: Vec<String> = token_freqs.iter()
+        .filter(|(_, &freq)| freq >= min_token_freq)
+        .map(|(token, _)| token.clone())
         .collect();
     vocab.sort();
+    drop(token_freqs); // Free memory
 
-    println!("Vocab size: {} tokens", vocab.len());
+    println!("Final vocab size: {} tokens", vocab.len());
+    let model = TinyRnnModel::new(vocab, CONTEXT_SIZE, HIDDEN_SIZE);
 
-    let model = TinyRnnModel::new(vocab.clone(), CONTEXT_SIZE, HIDDEN_SIZE);
-
-    // Second pass: Convert tokens directly to IDs without storing intermediate tokens
-    println!("Second pass: Converting text to token IDs...");
-    let mut token_ids = Vec::new();
-    token_ids.reserve(clean.split_whitespace().count() * 2); // Rough estimate
-
-    for word in clean.split_whitespace() {
-        if word_vocab.contains(word) {
-            if let Some(&id) = model.stoi.get(word) {
-                token_ids.push(id);
-            }
-        } else {
-            for ch in word.chars() {
-                if let Some(&id) = model.stoi.get(&ch.to_string()) {
-                    token_ids.push(id);
+    // Third pass: Convert text to IDs using parallel processing
+    println!("Third pass: Converting to token IDs in parallel...");
+    
+    // Process chunks in parallel and collect token IDs
+    let token_ids: Vec<usize> = chunk_ranges.par_iter()
+        .flat_map(|range| {
+            let chunk = &combined_text[range.clone()];
+            let mut chunk_ids = Vec::new();
+            
+            for word in clean_text(chunk).split_whitespace() {
+                if word_vocab.contains(word) {
+                    if let Some(&id) = model.stoi.get(word) {
+                        chunk_ids.push(id);
+                    }
+                } else {
+                    for ch in word.chars() {
+                        if let Some(&id) = model.stoi.get(&ch.to_string()) {
+                            chunk_ids.push(id);
+                        }
+                    }
                 }
             }
-        }
-    }
+            chunk_ids
+        })
+        .collect();
+    
+    drop(combined_text); // Free the original text
+    drop(word_vocab); // Free word vocabulary
 
     println!("Training for {} epochs...", EPOCHS);
 
