@@ -1,5 +1,6 @@
 use cpu_llm::{model::TinyRnnModel, io::save_model};
 use glob::glob;
+use rayon::prelude::*;
 use std::fs;
 
 const FIXED_VOCAB: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?'\n";
@@ -24,31 +25,26 @@ pub fn train(text: &str, output_path: &str) {
 fn main() {
     println!("📁 Scanning for training files in data/**/* ...");
 
-    let mut combined_text = String::new();
-    let mut file_count = 0;
+    let paths: Vec<_> = glob("data/**/*")
+        .expect("Failed to read glob pattern")
+        .filter_map(Result::ok)
+        .filter(|p| p.is_file())
+        .collect();
 
-    for entry in glob("data/**/*").expect("Failed to read glob pattern") {
-        match entry {
-            Ok(path) if path.is_file() => {
-                println!("📄 Loading {}", path.display());
-                match fs::read_to_string(&path) {
-                    Ok(content) => {
-                        combined_text.push_str(&content);
-                        file_count += 1;
-                    }
-                    Err(e) => eprintln!("⚠️ Could not read {}: {}", path.display(), e),
-                }
-            }
-            _ => {}
-        }
-    }
+    let contents: Vec<String> = paths.par_iter()
+        .filter_map(|path| {
+            fs::read_to_string(path).ok()
+        })
+        .collect();
 
-    if file_count == 0 {
+    let combined_text = contents.concat();
+
+    if contents.is_empty() {
         eprintln!("❌ No training files found in data/**/*");
         std::process::exit(1);
     }
 
-    println!("📚 Loaded {} files ({} characters total)", file_count, combined_text.len());
+    println!("📚 Loaded {} files ({} characters total)", contents.len(), combined_text.len());
 
     train(&combined_text, "model.json");
 }
