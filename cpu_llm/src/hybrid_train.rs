@@ -211,26 +211,43 @@ fn relu(x: &[f32]) -> Vec<f32> {
 
 // Parallel in-place linear operation
 fn linear_inplace_parallel(input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
-    // Initialize output with bias
-    output.iter_mut().zip(bias.iter()).for_each(|(o, &b)| *o = b);
-    
+    // SIMD optimization for output initialization and accumulation
+    use std::simd::{Simd, SimdFloat};
+    let simd_width = Simd::<f32, 8>::LANES;
+    let len = output.len();
+    let mut i = 0;
+    while i + simd_width <= len {
+        let bias_chunk = Simd::from_slice(&bias[i..i+simd_width]);
+        Simd::from_slice_mut(&mut output[i..i+simd_width]).copy_from(&bias_chunk);
+        i += simd_width;
+    }
+    while i < len {
+        output[i] = bias[i];
+        i += 1;
+    }
+
     // Split the work into chunks for each thread
     let chunk_size = std::cmp::max(1, output.len() / rayon::current_num_threads());
-    
+
     output.par_chunks_mut(chunk_size)
         .enumerate()
         .for_each(|(chunk_idx, out_chunk)| {
             let out_start = chunk_idx * chunk_size;
-            
-            // Process each input value
+            let out_len = out_chunk.len();
             for (i, &x) in input.iter().enumerate() {
-                if x == 0.0 { continue; }  // Skip zero inputs
-                
-                // Process output block for this chunk
-                for j in 0..out_chunk.len() {
-                    if out_start + j < weights[i].len() {
-                        out_chunk[j] += x * weights[i][out_start + j];
-                    }
+                if x == 0.0 { continue; }
+                let weights_row = &weights[i][out_start..out_start+out_len];
+                let mut j = 0;
+                while j + simd_width <= out_len {
+                    let w_chunk = Simd::from_slice(&weights_row[j..j+simd_width]);
+                    let o_chunk = Simd::from_slice(&out_chunk[j..j+simd_width]);
+                    let result = o_chunk + w_chunk * Simd::splat(x);
+                    Simd::from_slice_mut(&mut out_chunk[j..j+simd_width]).copy_from(&result);
+                    j += simd_width;
+                }
+                while j < out_len {
+                    out_chunk[j] += x * weights_row[j];
+                    j += 1;
                 }
             }
     });
@@ -518,7 +535,8 @@ fn main() {
         let total_batches = ((token_ids.len() - 1 - CONTEXT_SIZE) as f64 / BATCH_SIZE as f64).ceil() as usize;
 
         // Pre-allocate thread-local buffers to avoid repeated allocations
-        let chunk_size = BATCH_SIZE / rayon::current_num_threads().max(1);
+        // Use a larger chunk size for better parallel efficiency and cache locality
+        let chunk_size = (BATCH_SIZE / rayon::current_num_threads().max(1)).max(256);
         
         for idx in (CONTEXT_SIZE..token_ids.len() - 1).step_by(BATCH_SIZE) {
             let batch_start = Instant::now();
