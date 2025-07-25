@@ -6,8 +6,8 @@ use std::fs;
 use std::time::Instant;
 
 // Hyperparameters
-const CONTEXT_SIZE: usize = 2; // Further reduced context for speed
-const HIDDEN_SIZE: usize = 16; // Further reduced hidden size for speed
+const CONTEXT_SIZE: usize = 6; // Moderate context for better quality
+const HIDDEN_SIZE: usize = 48; // Moderate hidden size for better quality
 const EPOCHS: usize = 5;
 const BATCH_SIZE: usize = 1024; // Further reduced batch size for speed
 const LR: f32 = 0.003;
@@ -334,6 +334,12 @@ fn save_model(path: &str, model: &TinyRnnModel) -> std::io::Result<()> {
 
 fn main() {
     let output_path = "model.txt";
+    // Set rayon thread count from env (default: all cores)
+    if let Ok(num_threads) = std::env::var("RAYON_NUM_THREADS") {
+        if let Ok(n) = num_threads.parse::<usize>() {
+            rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
+        }
+    }
     println!("📁 Loading and concatenating files from data/**/* ...");
     let mut combined_text = String::new();
     let mut file_count = 0;
@@ -580,6 +586,8 @@ fn main() {
                     loss_sum / (end - idx) as f32,
                     eta / 60.0
                 );
+
+                std::process::exit(0); // Early exit for benchmarking speed
             }
         }
 
