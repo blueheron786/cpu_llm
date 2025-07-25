@@ -211,20 +211,8 @@ fn relu(x: &[f32]) -> Vec<f32> {
 
 // Parallel in-place linear operation
 fn linear_inplace_parallel(input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
-    // SIMD optimization for output initialization and accumulation
-    use std::simd::{Simd, SimdFloat};
-    let simd_width = Simd::<f32, 8>::LANES;
-    let len = output.len();
-    let mut i = 0;
-    while i + simd_width <= len {
-        let bias_chunk = Simd::from_slice(&bias[i..i+simd_width]);
-        Simd::from_slice_mut(&mut output[i..i+simd_width]).copy_from(&bias_chunk);
-        i += simd_width;
-    }
-    while i < len {
-        output[i] = bias[i];
-        i += 1;
-    }
+    // Initialize output with bias
+    output.iter_mut().zip(bias.iter()).for_each(|(o, &b)| *o = b);
 
     // Split the work into chunks for each thread
     let chunk_size = std::cmp::max(1, output.len() / rayon::current_num_threads());
@@ -233,21 +221,13 @@ fn linear_inplace_parallel(input: &[f32], weights: &[Vec<f32>], bias: &[f32], ou
         .enumerate()
         .for_each(|(chunk_idx, out_chunk)| {
             let out_start = chunk_idx * chunk_size;
-            let out_len = out_chunk.len();
             for (i, &x) in input.iter().enumerate() {
                 if x == 0.0 { continue; }
-                let weights_row = &weights[i][out_start..out_start+out_len];
-                let mut j = 0;
-                while j + simd_width <= out_len {
-                    let w_chunk = Simd::from_slice(&weights_row[j..j+simd_width]);
-                    let o_chunk = Simd::from_slice(&out_chunk[j..j+simd_width]);
-                    let result = o_chunk + w_chunk * Simd::splat(x);
-                    Simd::from_slice_mut(&mut out_chunk[j..j+simd_width]).copy_from(&result);
-                    j += simd_width;
-                }
-                while j < out_len {
-                    out_chunk[j] += x * weights_row[j];
-                    j += 1;
+                if out_start >= weights[i].len() { continue; }
+                let end_idx = (out_start + out_chunk.len()).min(weights[i].len());
+                let weights_row = &weights[i][out_start..end_idx];
+                for (out, &w) in out_chunk.iter_mut().take(weights_row.len()).zip(weights_row.iter()) {
+                    *out += x * w;
                 }
             }
     });
@@ -542,11 +522,6 @@ fn main() {
             let batch_start = Instant::now();
             let end = (idx + BATCH_SIZE).min(token_ids.len() - 1);
 
-            // Pre-allocate reusable buffers for the batch
-            let mut h_buffer = vec![0.0; model.hidden_size];
-            let mut logits_buffer = vec![0.0; model.vocab.len()];
-            let mut probs_buffer = vec![0.0; model.vocab.len()];
-
             // Process multiple samples per thread using chunked iteration
             let (grad_w_sum, grad_b_sum, loss_sum) = (idx..end).into_par_iter()
                 .chunks(chunk_size)
@@ -555,6 +530,9 @@ fn main() {
                     let mut grad_w = vec![vec![0.0; model.vocab.len()]; model.hidden_size];
                     let mut grad_b = vec![0.0; model.vocab.len()];
                     let mut loss = 0.0_f32;
+                    let mut h_buffer = vec![0.0; model.hidden_size];
+                    let mut logits_buffer = vec![0.0; model.vocab.len()];
+                    let mut probs_buffer = vec![0.0; model.vocab.len()];
 
                     // Reuse buffers for each sample in the chunk
                     for i in chunk {
