@@ -58,7 +58,6 @@ fn clean_text(text: &str) -> String {
     cleaned
 }
 
-
 // Build word vocab for words with frequency >= min_freq
 fn build_word_vocab(text: &str, min_freq: usize) -> HashSet<String> {
     // Split text into chunks for parallel processing

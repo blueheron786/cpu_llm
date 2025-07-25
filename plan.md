@@ -1,10 +1,5 @@
 # Optimization Plan for cpu_llm Training
 
-## 5. Custom Matrix Libraries
-- Replace nested `Vec<Vec<f32>>` with flat arrays (`Vec<f32>`) for better cache locality and SIMD compatibility.
-- Use libraries like `ndarray` or `nalgebra` for efficient matrix math.
-- Measure training speed and memory usage.
-
 ## 6. Profile and Tune Hotspots
 - Use `cargo-flamegraph` or `perf` to profile code and focus optimization on bottlenecks.
 - Document findings and improvements.
