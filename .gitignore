@@ -23,4 +23,5 @@ Cargo.lock
 path.ps1
 # Your personal training data
 data/
+# Generated and/or cached files
 model.json

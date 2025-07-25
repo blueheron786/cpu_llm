@@ -457,45 +457,30 @@ fn main() {
     // Third pass: Convert text to IDs using parallel processing, with disk cache
     println!("Third pass: Converting to token IDs in parallel (with cache)...");
     let token_id_cache_path = "token_ids.cache";
-    let token_ids: Vec<usize> = if std::path::Path::new(token_id_cache_path).exists() {
-        println!("Loading token IDs from cache...");
-        let bytes = std::fs::read(token_id_cache_path).expect("Failed to read token ID cache");
-        // Each usize is 8 bytes (on 64-bit), so read as chunks
-        bytes.chunks(8).map(|chunk| {
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(chunk);
-            usize::from_le_bytes(arr)
-        }).collect()
-    } else {
-        println!("Cache not found, computing token IDs...");
-        let ids: Vec<usize> = chunk_ranges.par_iter()
-            .flat_map(|range| {
-                let chunk = &combined_text[range.clone()];
-                let mut chunk_ids = Vec::new();
-                for word in clean_text(chunk).split_whitespace() {
-                    if word_vocab.contains(word) {
-                        if let Some(&id) = model.stoi.get(word) {
+    println!("Generating token IDs from scratch...");
+    let gen_start = Instant::now();
+    let token_ids: Vec<usize> = chunk_ranges.par_iter()
+        .flat_map(|range| {
+            let chunk = &combined_text[range.clone()];
+            let mut chunk_ids = Vec::new();
+            for word in clean_text(chunk).split_whitespace() {
+                if word_vocab.contains(word) {
+                    if let Some(&id) = model.stoi.get(word) {
+                        chunk_ids.push(id);
+                    }
+                } else {
+                    for ch in word.chars() {
+                        if let Some(&id) = model.stoi.get(&ch.to_string()) {
                             chunk_ids.push(id);
-                        }
-                    } else {
-                        for ch in word.chars() {
-                            if let Some(&id) = model.stoi.get(&ch.to_string()) {
-                                chunk_ids.push(id);
-                            }
                         }
                     }
                 }
-                chunk_ids
-            })
-            .collect();
-        // Save to cache
-        let mut bytes = Vec::with_capacity(ids.len() * 8);
-        for id in &ids {
-            bytes.extend_from_slice(&id.to_le_bytes());
-        }
-        std::fs::write(token_id_cache_path, &bytes).expect("Failed to write token ID cache");
-        ids
-    };
+            }
+            chunk_ids
+        })
+        .collect();
+    let gen_elapsed = gen_start.elapsed().as_secs_f64();
+    println!("Token IDs generated in {:.2}s", gen_elapsed);
     // Subsample for benchmarking speed
     let token_ids = if token_ids.len() > 1_000_000 {
         token_ids[..1_000_000].to_vec()
@@ -586,7 +571,6 @@ fn main() {
             if batch_count % 10 == 0 || batch_count == 1 {
                 let batch_duration = batch_start.elapsed().as_secs_f64();
                 let eta = batch_duration * (total_batches - batch_count) as f64;
-                
                 println!(
                     "Batch {}/{} ({:.1}%), loss {:.4}, ETA: {:.1}m",
                     batch_count,
@@ -595,7 +579,8 @@ fn main() {
                     loss_sum / (end - idx) as f32,
                     eta / 60.0
                 );
-
+                // Early exit for benchmarking speed
+                std::process::exit(0);
             }
         }
 
