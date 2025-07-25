@@ -1,8 +1,10 @@
 use glob::glob;
+// Remove unused measureme import
 use rayon::prelude::*;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 use std::time::Instant;
 
 // Hyperparameters
@@ -329,7 +331,11 @@ fn save_model(path: &str, model: &TinyRnnModel) -> std::io::Result<()> {
 }
 
 fn main() {
+    // Simple timing for now - we'll add more sophisticated profiling later
+    let start_time = Instant::now();
+    
     let output_path = "model.txt";
+    
     // Set rayon thread count from env (default: all cores)
     if let Ok(num_threads) = std::env::var("RAYON_NUM_THREADS") {
         if let Ok(n) = num_threads.parse::<usize>() {
@@ -497,6 +503,9 @@ fn main() {
         let mut total_loss = 0.0;
         let mut batch_count = 0;
         let total_batches = ((token_ids.len() - 1 - CONTEXT_SIZE) as f64 / BATCH_SIZE as f64).ceil() as usize;
+        
+        // Track epoch timing
+        let epoch_start = Instant::now();
 
         // Pre-allocate thread-local buffers to avoid repeated allocations
         // Use a larger chunk size for better parallel efficiency and cache locality
@@ -516,37 +525,45 @@ fn main() {
                 .chunks(chunk_size)
                 .map(|chunk| {
                     // Thread-local buffers allocated once per chunk
-                    let mut grad_w = vec![vec![0.0; model.vocab.len()]; model.hidden_size];
-                    let mut grad_b = vec![0.0; model.vocab.len()];
-                    let mut loss = 0.0_f32;
-                    let mut h_buffer = vec![0.0; model.hidden_size];
-                    let mut logits_buffer = vec![0.0; model.vocab.len()];
-                    let mut probs_buffer = vec![0.0; model.vocab.len()];
+                    let mut chunk_grad_w = vec![vec![0.0; model.vocab.len()]; model.hidden_size];
+                    let mut chunk_grad_b = vec![0.0; model.vocab.len()];
+                    let mut chunk_loss = 0.0;
 
-                    // Reuse buffers for each sample in the chunk
                     for i in chunk {
                         let context = &token_ids[i - CONTEXT_SIZE..i];
                         let target = token_ids[i];
-
-                        model.forward_buffered(context, &mut h_buffer, &mut logits_buffer);
-                        softmax_inplace(&mut logits_buffer, &mut probs_buffer);
-
-                        let safe_prob = probs_buffer[target].max(1e-8);
-                        loss += -safe_prob.ln();
-
-                        probs_buffer[target] -= 1.0;
+                        
+                        // Forward pass
+                        let mut h = vec![0.0; model.hidden_size];
+                        let mut logits = vec![0.0; model.vocab.len()];
+                        model.forward_buffered(context, &mut h, &mut logits);
+                        
+                        // Compute softmax and loss
+                        let mut probs = vec![0.0; model.vocab.len()];
+                        softmax_inplace(&mut logits, &mut probs);
+                        let safe_prob = probs[target].max(1e-10);
+                        chunk_loss += -safe_prob.ln();
+                        
+                        // Compute gradients
                         for j in 0..model.hidden_size {
-                            let h_j = h_buffer[j];
-                            let grad_w_j = &mut grad_w[j];
-                            for (k, &dl_k) in probs_buffer.iter().enumerate() {
-                                grad_w_j[k] += dl_k * h_j;
+                            let h_j = h[j];
+                            let grad_w_j = &mut chunk_grad_w[j];
+                            for (k, &p) in probs.iter().enumerate() {
+                                let grad = if k == target { p - 1.0 } else { p };
+                                grad_w_j[k] += grad * h_j;
                             }
                         }
-                        grad_b.iter_mut().zip(probs_buffer.iter())
-                            .for_each(|(gb, &dl)| *gb += dl);
+                        
+                        // Update bias gradients
+                        for (gb, &p) in chunk_grad_b.iter_mut().zip(probs.iter()) {
+                            *gb += if p > 1e-10 { p } else { 0.0 };
+                        }
+                        if target < chunk_grad_b.len() {
+                            chunk_grad_b[target] -= 1.0;
+                        }
                     }
-
-                    (grad_w, grad_b, loss)
+                    
+                    (chunk_grad_w, chunk_grad_b, chunk_loss)
                 })
                 .reduce(
                     || (
@@ -566,14 +583,19 @@ fn main() {
                     },
                 );
 
-            // Accumulate gradients
-            accum_grad_w.iter_mut().zip(grad_w_sum.iter())
+            // Parallel gradient accumulation
+            accum_grad_w.par_iter_mut()
+                .zip(grad_w_sum.par_iter())
                 .for_each(|(acc_row, grad_row)| {
-                    acc_row.iter_mut().zip(grad_row.iter())
-                        .for_each(|(acc, grad)| *acc += grad);
+                    acc_row.par_iter_mut()
+                        .zip(grad_row.par_iter())
+                        .for_each(|(acc, &grad)| *acc += grad);
                 });
-            accum_grad_b.iter_mut().zip(grad_b_sum.iter())
-                .for_each(|(acc, grad)| *acc += grad);
+            
+            accum_grad_b.par_iter_mut()
+                .zip(grad_b_sum.par_iter())
+                .for_each(|(acc, &grad)| *acc += grad);
+                
             accum_count += 1;
 
             // Update weights every ACCUM_STEPS mini-batches
