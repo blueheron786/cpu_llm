@@ -457,32 +457,48 @@ fn main() {
     println!("Final vocab size: {} tokens", vocab.len());
     let mut model = TinyRnnModel::new(vocab, CONTEXT_SIZE, HIDDEN_SIZE);
 
-    // Third pass: Convert text to IDs using parallel processing
-    println!("Third pass: Converting to token IDs in parallel...");
-    
-    // Process chunks in parallel and collect token IDs
-    let token_ids: Vec<usize> = chunk_ranges.par_iter()
-        .flat_map(|range| {
-            let chunk = &combined_text[range.clone()];
-            let mut chunk_ids = Vec::new();
-            
-            for word in clean_text(chunk).split_whitespace() {
-                if word_vocab.contains(word) {
-                    if let Some(&id) = model.stoi.get(word) {
-                        chunk_ids.push(id);
-                    }
-                } else {
-                    for ch in word.chars() {
-                        if let Some(&id) = model.stoi.get(&ch.to_string()) {
+    // Third pass: Convert text to IDs using parallel processing, with disk cache
+    println!("Third pass: Converting to token IDs in parallel (with cache)...");
+    let token_id_cache_path = "token_ids.cache";
+    let token_ids: Vec<usize> = if std::path::Path::new(token_id_cache_path).exists() {
+        println!("Loading token IDs from cache...");
+        let bytes = std::fs::read(token_id_cache_path).expect("Failed to read token ID cache");
+        // Each usize is 8 bytes (on 64-bit), so read as chunks
+        bytes.chunks(8).map(|chunk| {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(chunk);
+            usize::from_le_bytes(arr)
+        }).collect()
+    } else {
+        println!("Cache not found, computing token IDs...");
+        let ids: Vec<usize> = chunk_ranges.par_iter()
+            .flat_map(|range| {
+                let chunk = &combined_text[range.clone()];
+                let mut chunk_ids = Vec::new();
+                for word in clean_text(chunk).split_whitespace() {
+                    if word_vocab.contains(word) {
+                        if let Some(&id) = model.stoi.get(word) {
                             chunk_ids.push(id);
+                        }
+                    } else {
+                        for ch in word.chars() {
+                            if let Some(&id) = model.stoi.get(&ch.to_string()) {
+                                chunk_ids.push(id);
+                            }
                         }
                     }
                 }
-            }
-            chunk_ids
-        })
-        .collect();
-    
+                chunk_ids
+            })
+            .collect();
+        // Save to cache
+        let mut bytes = Vec::with_capacity(ids.len() * 8);
+        for id in &ids {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        std::fs::write(token_id_cache_path, &bytes).expect("Failed to write token ID cache");
+        ids
+    };
     // Subsample for benchmarking speed
     let token_ids = if token_ids.len() > 1_000_000 {
         token_ids[..1_000_000].to_vec()
@@ -508,6 +524,11 @@ fn main() {
             let batch_start = Instant::now();
             let end = (idx + BATCH_SIZE).min(token_ids.len() - 1);
 
+            // Pre-allocate reusable buffers for the batch
+            let mut h_buffer = vec![0.0; model.hidden_size];
+            let mut logits_buffer = vec![0.0; model.vocab.len()];
+            let mut probs_buffer = vec![0.0; model.vocab.len()];
+
             // Process multiple samples per thread using chunked iteration
             let (grad_w_sum, grad_b_sum, loss_sum) = (idx..end).into_par_iter()
                 .chunks(chunk_size)
@@ -516,26 +537,19 @@ fn main() {
                     let mut grad_w = vec![vec![0.0; model.vocab.len()]; model.hidden_size];
                     let mut grad_b = vec![0.0; model.vocab.len()];
                     let mut loss = 0.0_f32;
-                    let mut h_buffer = vec![0.0; model.hidden_size];
-                    let mut logits_buffer = vec![0.0; model.vocab.len()];
-                    let mut probs_buffer = vec![0.0; model.vocab.len()];
 
-                    // Process multiple samples in this thread
+                    // Reuse buffers for each sample in the chunk
                     for i in chunk {
                         let context = &token_ids[i - CONTEXT_SIZE..i];
                         let target = token_ids[i];
 
-                        // Reuse buffers for forward pass
                         model.forward_buffered(context, &mut h_buffer, &mut logits_buffer);
                         softmax_inplace(&mut logits_buffer, &mut probs_buffer);
 
                         let safe_prob = probs_buffer[target].max(1e-8);
                         loss += -safe_prob.ln();
 
-                        // Compute gradients in-place
                         probs_buffer[target] -= 1.0;
-                        
-                        // Optimized gradient accumulation
                         for j in 0..model.hidden_size {
                             let h_j = h_buffer[j];
                             let grad_w_j = &mut grad_w[j];
@@ -556,7 +570,6 @@ fn main() {
                         0.0_f32,
                     ),
                     |(mut acc_w, mut acc_b, acc_loss), (grad_w, grad_b, loss)| {
-                        // Optimized gradient reduction
                         acc_w.iter_mut().zip(grad_w.iter())
                             .for_each(|(acc_row, grad_row)| {
                                 acc_row.iter_mut().zip(grad_row.iter())
@@ -587,7 +600,6 @@ fn main() {
                     eta / 60.0
                 );
 
-                std::process::exit(0); // Early exit for benchmarking speed
             }
         }
 
