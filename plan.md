@@ -1,10 +1,5 @@
 # Optimization Plan for cpu_llm Training
 
-
-## 4. SIMD via External Libraries
-- Use stable SIMD libraries like `faster`, `packed_simd_2`, or `nalgebra` for matrix operations.
-- Measure matrix operation speed before and after.
-
 ## 5. Custom Matrix Libraries
 - Replace nested `Vec<Vec<f32>>` with flat arrays (`Vec<f32>`) for better cache locality and SIMD compatibility.
 - Use libraries like `ndarray` or `nalgebra` for efficient matrix math.

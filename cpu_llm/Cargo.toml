@@ -12,6 +12,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.29"
 
+
 [lib]
 name = "cpu_llm"
 path = "src/lib.rs"
