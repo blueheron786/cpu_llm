@@ -1,18 +1,5 @@
 # Optimization Plan for cpu_llm Training
 
-## 1. Mixed Precision Training
-- Convert weights, activations, and gradients to half-precision (`f16` or `bf16`) using the `half` crate.
-- Measure training speed and memory usage before and after.
-- Validate correctness and ensure no loss of stability.
-
-## 2. Memory-Mapped Data
-- Use memory-mapped files (`mmap`) for large datasets to avoid loading all data into RAM.
-- Measure I/O speed and memory usage before and after.
-
-## 3. Gradient Accumulation
-- Accumulate gradients over several mini-batches before updating weights.
-- Allows for larger effective batch sizes without increasing memory usage.
-- Measure training speed and loss convergence.
 
 ## 4. SIMD via External Libraries
 - Use stable SIMD libraries like `faster`, `packed_simd_2`, or `nalgebra` for matrix operations.

@@ -503,6 +503,11 @@ fn main() {
         // Use a larger chunk size for better parallel efficiency and cache locality
         let chunk_size = (BATCH_SIZE / rayon::current_num_threads().max(1)).max(256);
         
+        // Gradient accumulation buffers
+        let mut accum_grad_w = vec![vec![0.0; model.vocab.len()]; model.hidden_size];
+        let mut accum_grad_b = vec![0.0; model.vocab.len()];
+        let mut accum_count = 0;
+
         for idx in (CONTEXT_SIZE..token_ids.len() - 1).step_by(BATCH_SIZE) {
             let batch_start = Instant::now();
             let end = (idx + BATCH_SIZE).min(token_ids.len() - 1);
@@ -562,7 +567,27 @@ fn main() {
                     },
                 );
 
-            model.update_weights(&grad_w_sum, &grad_b_sum, LR, end - idx);
+            // Accumulate gradients
+            accum_grad_w.iter_mut().zip(grad_w_sum.iter())
+                .for_each(|(acc_row, grad_row)| {
+                    acc_row.iter_mut().zip(grad_row.iter())
+                        .for_each(|(acc, grad)| *acc += grad);
+                });
+            accum_grad_b.iter_mut().zip(grad_b_sum.iter())
+                .for_each(|(acc, grad)| *acc += grad);
+            accum_count += 1;
+
+            // Update weights every ACCUM_STEPS mini-batches
+            const ACCUM_STEPS: usize = 4;
+            if accum_count == ACCUM_STEPS || batch_count + 1 == total_batches {
+                model.update_weights(&accum_grad_w, &accum_grad_b, LR, BATCH_SIZE * accum_count);
+                // Reset accumulation buffers
+                for row in accum_grad_w.iter_mut() {
+                    for v in row.iter_mut() { *v = 0.0; }
+                }
+                for v in accum_grad_b.iter_mut() { *v = 0.0; }
+                accum_count = 0;
+            }
 
             total_loss += loss_sum;
             batch_count += 1;
@@ -579,8 +604,11 @@ fn main() {
                     loss_sum / (end - idx) as f32,
                     eta / 60.0
                 );
+                
                 // Early exit for benchmarking speed
-                std::process::exit(0);
+                if (batch_count >= 20) {
+                    std::process::exit(0);
+                }
             }
         }
 
