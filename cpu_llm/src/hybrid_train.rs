@@ -6,11 +6,11 @@ use std::fs;
 use std::time::Instant;
 
 // Hyperparameters
-const CONTEXT_SIZE: usize = 8;
-const HIDDEN_SIZE: usize = 64;
+const CONTEXT_SIZE: usize = 2; // Further reduced context for speed
+const HIDDEN_SIZE: usize = 16; // Further reduced hidden size for speed
 const EPOCHS: usize = 5;
-const BATCH_SIZE: usize = 16384;  // Further increased batch size for faster training
-const LR: f32 = 0.003;  // Further reduced learning rate for stability
+const BATCH_SIZE: usize = 1024; // Further reduced batch size for speed
+const LR: f32 = 0.003;
 
 // Hybrid tokenizer tokens: either full word or char fallback
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -477,6 +477,12 @@ fn main() {
         })
         .collect();
     
+    // Subsample for benchmarking speed
+    let token_ids = if token_ids.len() > 1_000_000 {
+        token_ids[..1_000_000].to_vec()
+    } else {
+        token_ids
+    };
     drop(combined_text); // Free the original text
     drop(word_vocab); // Free word vocabulary
 
