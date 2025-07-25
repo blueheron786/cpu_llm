@@ -9,8 +9,8 @@ use std::time::Instant;
 const CONTEXT_SIZE: usize = 8;
 const HIDDEN_SIZE: usize = 64;
 const EPOCHS: usize = 5;
-const BATCH_SIZE: usize = 4096;  // Increased batch size for faster training
-const LR: f32 = 0.01;  // Slightly reduced learning rate for larger batches
+const BATCH_SIZE: usize = 16384;  // Further increased batch size for faster training
+const LR: f32 = 0.003;  // Further reduced learning rate for stability
 
 // Hybrid tokenizer tokens: either full word or char fallback
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -211,18 +211,28 @@ fn relu(x: &[f32]) -> Vec<f32> {
 
 // Parallel in-place linear operation
 fn linear_inplace_parallel(input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
-    output.copy_from_slice(bias);
+    // Initialize output with bias
+    output.iter_mut().zip(bias.iter()).for_each(|(o, &b)| *o = b);
     
-    // Split the output into chunks for parallel processing
-    let chunk_size = (output.len() + rayon::current_num_threads() - 1) / rayon::current_num_threads();
-    output.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
-        let start_idx = chunk_idx * chunk_size;
-        for (i, &x) in input.iter().enumerate() {
-            let row = &weights[i][start_idx..start_idx + out_chunk.len()];
-            for (out, &w) in out_chunk.iter_mut().zip(row.iter()) {
-                *out += x * w;
+    // Split the work into chunks for each thread
+    let chunk_size = std::cmp::max(1, output.len() / rayon::current_num_threads());
+    
+    output.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            let out_start = chunk_idx * chunk_size;
+            
+            // Process each input value
+            for (i, &x) in input.iter().enumerate() {
+                if x == 0.0 { continue; }  // Skip zero inputs
+                
+                // Process output block for this chunk
+                for j in 0..out_chunk.len() {
+                    if out_start + j < weights[i].len() {
+                        out_chunk[j] += x * weights[i][out_start + j];
+                    }
+                }
             }
-        }
     });
 }
 
@@ -273,7 +283,57 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     output
 }
 
+// Save model to a file
+fn save_model(path: &str, model: &TinyRnnModel) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::File::create(path)?;
+    
+    // Write vocab
+    for token in &model.vocab {
+        writeln!(file, "{}", token)?;
+    }
+    
+    // Write embeddings
+    for row in &model.embedding {
+        for &val in row {
+            write!(file, "{} ", val)?;
+        }
+        writeln!(file)?;
+    }
+    
+    // Write ff1 weights
+    for row in &model.ff1_weights {
+        for &val in row {
+            write!(file, "{} ", val)?;
+        }
+        writeln!(file)?;
+    }
+    
+    // Write ff1 bias
+    for &val in &model.ff1_bias {
+        write!(file, "{} ", val)?;
+    }
+    writeln!(file)?;
+    
+    // Write ff2 weights
+    for row in &model.ff2_weights {
+        for &val in row {
+            write!(file, "{} ", val)?;
+        }
+        writeln!(file)?;
+    }
+    
+    // Write ff2 bias
+    for &val in &model.ff2_bias {
+        write!(file, "{} ", val)?;
+    }
+    writeln!(file)?;
+    
+    Ok(())
+}
+
 fn main() {
+    let output_path = "model.txt";
     println!("📁 Loading and concatenating files from data/**/* ...");
     let mut combined_text = String::new();
     let mut file_count = 0;
@@ -307,11 +367,18 @@ fn main() {
     
     println!("First pass: Counting frequencies in parallel chunks...");
     
-    // Create chunk ranges for parallel processing
-    let chunk_ranges: Vec<_> = (0..combined_text.len())
-        .step_by(CHUNK_SIZE)
-        .map(|start| start..((start + CHUNK_SIZE).min(combined_text.len())))
-        .collect();
+    // Create chunk ranges for parallel processing, ensuring we split at char boundaries
+    let mut chunk_ranges = Vec::new();
+    let mut start = 0;
+    while start < combined_text.len() {
+        let mut end = (start + CHUNK_SIZE).min(combined_text.len());
+        // Adjust end to land on a char boundary
+        while !combined_text.is_char_boundary(end) && end > start {
+            end -= 1;
+        }
+        chunk_ranges.push(start..end);
+        start = end;
+    }
     
     // Process chunks in parallel to count word frequencies
     let word_freqs = chunk_ranges.par_iter()
@@ -337,7 +404,7 @@ fn main() {
 
     // Build word vocabulary from frequent words
     let word_vocab: HashSet<String> = word_freqs.into_par_iter()
-        .filter(|(_, freq)| *freq >= 15)
+        .filter(|(_, freq)| *freq >= 100)  // Further increased frequency threshold
         .map(|(word, _)| word)
         .collect();
     
@@ -519,4 +586,9 @@ fn main() {
     }
 
     println!("Training complete!");
+
+    match save_model(output_path, &model) {
+        Ok(_) => println!("✅ Model saved to {}", output_path),
+        Err(e) => eprintln!("❌ Failed to save model: {}", e),
+    }
 }

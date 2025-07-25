@@ -6,6 +6,8 @@ LLM built from the ground-up to use CPUs (multiple threads) and CPU RAM instead 
 
 Unlike other existing solutions (circa 2025), the aim is not to take GPU-centric models and limit them to work on CPUs; it's to build something from the ground-up that's made to run efficiently on CPUs.
 
+As of right now, it's optimized to run as fast as possible, while trying to keep memory from being consumed in an unbound manner. It generally stays within 2GB of memory while training, albeit in some places, memory usage increases logarithmetically.
+
 This is a rapidly-changing, highly experimental fun project. Feel free to open a PR and add your personal touch!
 
 ## Usage
