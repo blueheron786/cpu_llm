@@ -1,11 +1,19 @@
-use glob::glob;
-// Remove unused measureme import
-use rayon::prelude::*;
+//! Hybrid tokenizer and training for the CPU LLM
+
+use futures_util::StreamExt;
 use rand::Rng;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
+use tokio::runtime::Runtime;
+
+mod async_io;
+use async_io::process_files;
+
+// Use clean_text from async_io module
+use crate::async_io::clean_text;
 
 // Hyperparameters
 const CONTEXT_SIZE: usize = 6; // Moderate context for better quality
@@ -30,35 +38,7 @@ impl Token {
     }
 }
 
-// Clean text by normalizing spaces and lowercasing. Efficiently.
-fn clean_text(text: &str) -> String {
-    let mut cleaned = String::with_capacity(text.len());
-    let mut prev_was_space = false;
 
-    for c in text.chars() {
-        let c = match c {
-            '\n' | '\r' => ' ',
-            _ => c.to_ascii_lowercase(),
-        };
-
-        if c.is_whitespace() {
-            if !prev_was_space {
-                cleaned.push(' ');
-                prev_was_space = true;
-            }
-        } else {
-            cleaned.push(c);
-            prev_was_space = false;
-        }
-    }
-
-    // Trim trailing space if any
-    if cleaned.ends_with(' ') {
-        cleaned.pop();
-    }
-
-    cleaned
-}
 
 // Build word vocab for words with frequency >= min_freq
 fn build_word_vocab(text: &str, min_freq: usize) -> HashSet<String> {
@@ -330,7 +310,7 @@ fn save_model(path: &str, model: &TinyRnnModel) -> std::io::Result<()> {
     Ok(())
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Simple timing for now - we'll add more sophisticated profiling later
     let start_time = Instant::now();
     
@@ -342,44 +322,45 @@ fn main() {
             rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
         }
     }
-    println!("📁 Loading and concatenating files from data/**/* ...");
-    let mut combined_text = String::new();
-    let mut file_count = 0;
 
-    for entry in glob("data/**/*").expect("Failed to read glob pattern") {
-        if let Ok(path) = entry {
-            if path.is_file() {
-                println!("📄 Loading {}", path.display());
-                if let Ok(content) = fs::read_to_string(&path) {
-                    combined_text.push_str(&content);
-                    combined_text.push(' '); // separate files with space
-                    file_count += 1;
-                }
+    // Create a new Tokio runtime for async operations
+    let rt = Runtime::new()?;
+    
+    // Process files asynchronously with a concurrency of 8 (configurable)
+    println!("📁 Loading files asynchronously from data/**/* ...");
+    
+    // Process files in chunks of 1MB with a concurrency of 8
+    let chunk_size = 1_000_000; // 1MB chunks
+    let concurrency = 8; // Number of files to process in parallel
+    
+    // Collect all text content asynchronously
+    let combined_text = {
+        rt.block_on(async {
+            let mut combined = String::new();
+            let stream = process_files("data/**/*", chunk_size, concurrency).await;
+            
+            // Convert the stream of chunks into a single string
+            tokio::pin!(stream);
+            while let Some(chunk) = stream.next().await {
+                combined.push_str(&chunk);
             }
-        }
-    }
-
-    if file_count == 0 {
-        eprintln!("❌ No files found");
+            
+            combined
+        })
+    };
+    
+    if combined_text.is_empty() {
+        eprintln!("❌ No files found or no content processed");
         std::process::exit(1);
     }
-
-    println!(
-        "📚 Loaded {} files, total {} chars",
-        file_count,
-        combined_text.len()
-    );
-
-    // Process text in chunks to avoid storing the entire cleaned text
-    const CHUNK_SIZE: usize = 1_000_000; // Process 1MB at a time
     
-    println!("First pass: Counting frequencies in parallel chunks...");
+    println!("📚 Processed {} bytes of text", combined_text.len());
     
     // Create chunk ranges for parallel processing, ensuring we split at char boundaries
     let mut chunk_ranges = Vec::new();
     let mut start = 0;
     while start < combined_text.len() {
-        let mut end = (start + CHUNK_SIZE).min(combined_text.len());
+        let mut end = (start + chunk_size).min(combined_text.len());
         // Adjust end to land on a char boundary
         while !combined_text.is_char_boundary(end) && end > start {
             end -= 1;
@@ -462,7 +443,7 @@ fn main() {
     // Third pass: Convert text to IDs using parallel processing, with disk cache
     println!("Third pass: Converting to token IDs in parallel (with cache)...");
     let token_id_cache_path = "token_ids.cache";
-    println!("Generating token IDs from scratch...");
+    println!("Generating token IDs...");
     let gen_start = Instant::now();
     let token_ids: Vec<usize> = chunk_ranges.par_iter()
         .flat_map(|range| {
@@ -627,7 +608,7 @@ fn main() {
                 );
                 
                 // Early exit for benchmarking speed
-                if (batch_count >= 20) {
+                if batch_count >= 20 {
                     std::process::exit(0);
                 }
             }
@@ -644,7 +625,13 @@ fn main() {
     println!("Training complete!");
 
     match save_model(output_path, &model) {
-        Ok(_) => println!("✅ Model saved to {}", output_path),
-        Err(e) => eprintln!("❌ Failed to save model: {}", e),
+        Ok(_) => {
+            println!("✅ Model saved to {}", output_path);
+            Ok(())
+        },
+        Err(e) => {
+            eprintln!("❌ Failed to save model: {}", e);
+            Ok(()) // Continue execution even if save fails
+        }
     }
 }

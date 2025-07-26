@@ -1,9 +1,5 @@
 # Optimization Plan for cpu_llm Training
 
-## 6. Profile and Tune Hotspots
-- Use `cargo-flamegraph` or `perf` to profile code and focus optimization on bottlenecks.
-- Document findings and improvements.
-
 ## 7. Asynchronous Data Loading
 - Overlap data loading and preprocessing with training using threads or async tasks.
 - Measure data loading and training overlap efficiency.
