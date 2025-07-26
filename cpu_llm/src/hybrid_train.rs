@@ -606,11 +606,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     loss_sum / (end - idx) as f32,
                     eta / 60.0
                 );
-                
-                // Early exit for benchmarking speed
-                if batch_count >= 20 {
-                    std::process::exit(0);
-                }
             }
         }
 
