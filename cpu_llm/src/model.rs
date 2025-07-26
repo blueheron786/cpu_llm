@@ -147,13 +147,30 @@ vec![0.0; vocab.len()],     // logits
     }
     
     fn linear_inplace(&self, input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
+        // Debug information
+        println!("linear_inplace: input.len() = {}, weights.len() = {}, bias.len() = {}, output.len() = {}", 
+                 input.len(), weights.len(), bias.len(), output.len());
+        
         output.par_iter_mut().enumerate().for_each(|(i, out)| {
+            if i >= weights.len() {
+                println!("Index out of bounds: i = {}, weights.len() = {}", i, weights.len());
+                return;
+            }
             let row = &weights[i];
             let mut sum = 0.0f32;
             for (j, &w) in row.iter().enumerate() {
+                if j >= input.len() {
+                    println!("Index out of bounds in row access: j = {}, input.len() = {}", j, input.len());
+                    break;
+                }
                 sum += input[j] * w;
             }
-            *out = sum + bias[i];
+            if i < bias.len() {
+                *out = sum + bias[i];
+            } else {
+                println!("Index out of bounds for bias: i = {}, bias.len() = {}", i, bias.len());
+                *out = sum;
+            }
         });
     }
 }

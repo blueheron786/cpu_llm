@@ -3,6 +3,8 @@
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
+use glob::glob;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -227,16 +229,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📚 Building vocabulary...");
     let word_freq = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
     
-    // Process files and build word frequencies
-    let chunks = rt.block_on(process_files("data/**/*"))?;
+    // Process files in smaller chunks to save memory
+    let chunk_size = 1024 * 1024; // Process 1MB at a time
+    let files = glob::glob("data/**/*")?;
     
-    // Process each chunk to build word frequencies
-    for chunk in &chunks {
-        let mut freq_map = word_freq.lock().unwrap();
-        for word in chunk.split_whitespace() {
-            if !word.is_empty() {
-                *freq_map.entry(word.to_string()).or_insert(0) += 1;
+    for file in files.filter_map(Result::ok) {
+        if !file.is_file() { continue; }
+        
+        let file = File::open(&file)?;
+        let reader = BufReader::new(file);
+        let mut buffer = String::with_capacity(chunk_size);
+        
+        for line in reader.lines().filter_map(Result::ok) {
+            buffer.push_str(&line);
+            buffer.push(' '); // Add space to separate lines
+            
+            if buffer.len() >= chunk_size {
+                let chunk = buffer.drain(..).collect::<String>();
+                let mut freq_map = word_freq.lock().unwrap();
+                for word in chunk.split_whitespace() {
+                    if !word.is_empty() {
+                        *freq_map.entry(word.to_string()).or_insert(0) += 1;
+                    }
+                }
             }
+        }
+        
+        // Process remaining content in buffer
+        if !buffer.is_empty() {
+            let mut freq_map = word_freq.lock().unwrap();
+            for word in buffer.split_whitespace() {
+                if !word.is_empty() {
+                    *freq_map.entry(word.to_string()).or_insert(0) += 1;
+                }
+            }
+            buffer.clear();
         }
     }
     
@@ -251,44 +278,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("📚 Built vocabulary of {} words", word_vocab.len());
     
-    // Second pass: tokenize and build final dataset
+    // Second pass: tokenize and build final dataset with streaming
     println!("🔠 Tokenizing text...");
     let token_freq = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
-    let mut token_ids = Vec::new();
+    let token_ids = Arc::new(Mutex::new(Vec::new()));
     
-    // Process each chunk to build token frequencies and IDs
-    for chunk in chunks {
-        let mut local_token_ids = Vec::new();
-        let mut local_token_freq = HashMap::new();
+    // Process files in the same chunked manner
+    let files = glob::glob("data/**/*")?;
+    
+    for file in files.filter_map(Result::ok) {
+        if !file.is_file() { continue; }
         
-        for word in chunk.split_whitespace() {
-            if word.is_empty() {
-                continue;
-            }
+        let file = File::open(&file)?;
+        let reader = BufReader::new(file);
+        
+        for line in reader.lines().filter_map(Result::ok) {
+            let mut local_token_ids = Vec::new();
+            let mut local_token_freq = HashMap::new();
             
-            if word_vocab.contains(word) {
-                // Word is in vocabulary, use as is
-                *local_token_freq.entry(word.to_string()).or_insert(0) += 1;
-                local_token_ids.push(word.to_string());
-            } else {
-                // Word not in vocabulary, split into characters
-                for ch in word.chars() {
-                    let ch_str = ch.to_string();
-                    *local_token_freq.entry(ch_str.clone()).or_insert(0) += 1;
-                    local_token_ids.push(ch_str);
+            for word in line.split_whitespace() {
+                if word.is_empty() {
+                    continue;
+                }
+                
+                if word_vocab.contains(word) {
+                    // Word is in vocabulary, use as is
+                    *local_token_freq.entry(word.to_string()).or_insert(0) += 1;
+                    local_token_ids.push(word.to_string());
+                } else {
+                    // Word not in vocabulary, split into characters
+                    for ch in word.chars() {
+                        let ch_str = ch.to_string();
+                        *local_token_freq.entry(ch_str.clone()).or_insert(0) += 1;
+                        local_token_ids.push(ch_str);
+                    }
                 }
             }
+            
+            // Merge with global frequencies and token IDs
+            let mut global_freq = token_freq.lock().unwrap();
+            for (token, count) in local_token_freq {
+                *global_freq.entry(token).or_insert(0) += count;
+            }
+            
+            // Add to token IDs
+            let mut ids = token_ids.lock().unwrap();
+            ids.extend(local_token_ids);
         }
-        
-        // Merge with global frequencies
-        let mut global_freq = token_freq.lock().unwrap();
-        for (token, count) in local_token_freq {
-            *global_freq.entry(token).or_insert(0) += count;
-        }
-        
-        // Add to token IDs
-        token_ids.extend(local_token_ids);
     }
+    
+    // Convert Arc<Mutex<Vec<String>>> to Vec<String>
+    let token_ids = Arc::try_unwrap(token_ids).unwrap().into_inner()?;
     
     if token_ids.is_empty() {
         eprintln!("❌ No tokens found in the processed files");
