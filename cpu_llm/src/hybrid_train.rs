@@ -380,7 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(&mut token_ids_writer, "{}", id)?;
         token_count += 1;
         
-        if token_count % 100000 == 0 {
+        if token_count % 10000000 == 0 {
             println!("Processed {} tokens...", token_count);
             token_ids_writer.flush()?;
         }
@@ -562,14 +562,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         
-                        // Forward pass
-                        let mut h = vec![0.0; model.hidden_size];
-                        let mut logits = vec![0.0; model.vocab.len()];
-                        
                         // Ensure all context tokens are within vocabulary
                         if context.iter().any(|&id| id >= model.vocab.len()) {
                             continue;
                         }
+                        
+                        // Forward pass with output projection
+                        let mut h = vec![0.0; model.hidden_size];
+                        let mut logits = vec![0.0; model.vocab.len()];
                         
                         model.forward_buffered(context, &mut h, &mut logits);
                         
@@ -580,6 +580,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         chunk_loss += -safe_prob.ln();
                         
                         // Compute gradients
+                        // Note: This is a simplified gradient computation
+                        // In a full implementation, you'd need to backpropagate through the output projection
                         for j in 0..model.hidden_size {
                             let h_j = h[j];
                             let grad_w_j = &mut chunk_grad_w[j];

@@ -37,6 +37,9 @@ pub struct TinyRnnModel {
     pub ff1_bias: Vec<f32>,
     pub ff2_weights: Vec<Vec<f32>>,
     pub ff2_bias: Vec<f32>,
+    // Output projection
+    pub output_weights: Vec<Vec<f32>>,
+    pub output_bias: Vec<f32>,
     // Buffers for training
     temp_buffers: [Vec<f32>; 4],
 }
@@ -68,31 +71,44 @@ impl TinyRnnModel {
             .collect();
 
         // Initialize first feed-forward layer
-        let ff1_weights: Vec<Vec<f32>> = (0..hidden_size)
-            .into_par_iter()
-            .map(|_| {
-                let mut rng = rand::thread_rng();
-                (0..hidden_size).map(|_| dist.sample(&mut rng)).collect()
-            })
-            .collect();
+        let mut ff1_weights = vec![vec![0.0; hidden_size]; hidden_size];
+        let mut ff1_bias = vec![0.0; hidden_size];
+        let mut ff2_weights = vec![vec![0.0; hidden_size]; hidden_size];
+        let mut ff2_bias = vec![0.0; hidden_size];
         
-        let ff1_bias = vec![0.0; hidden_size];
-
-        // Initialize second feed-forward layer
-        let ff2_weights: Vec<Vec<f32>> = (0..vocab.len())
-            .into_par_iter()
-            .map(|_| {
-                let mut rng = rand::thread_rng();
-                (0..hidden_size).map(|_| dist.sample(&mut rng)).collect()
-            })
-            .collect();
+        // Initialize output projection
+        let vocab_size = vocab.len();
+        let mut output_weights = vec![vec![0.0; vocab_size]; hidden_size];
+        let mut output_bias = vec![0.0; vocab_size];
+        
+        // Initialize with small random values
+        let mut rng = rand::thread_rng();
+        let uniform = Uniform::new(-0.1, 0.1);
+        
+        // Initialize feed-forward weights
+        for i in 0..hidden_size {
+            for j in 0..hidden_size {
+                ff1_weights[i][j] = uniform.sample(&mut rng);
+                ff2_weights[i][j] = uniform.sample(&mut rng);
+            }
+            ff1_bias[i] = 0.0;  // Initialize biases to zero
+            ff2_bias[i] = 0.0;
             
-        let ff2_bias = vec![0.0; vocab.len()];
+            // Initialize output projection weights
+            for j in 0..vocab_size {
+                output_weights[i][j] = uniform.sample(&mut rng);
+            }
+        }
         
+        // Initialize output bias to zero
+        for i in 0..vocab_size {
+            output_bias[i] = 0.0;
+        }
+
         // Initialize reusable buffers for training
         let temp_buffers = [
             vec![0.0; hidden_size],    // h
-vec![0.0; vocab.len()],     // logits
+            vec![0.0; vocab.len()],     // logits
             vec![0.0; hidden_size],    // grad_h
             vec![0.0; hidden_size],    // grad_ff1
         ];
@@ -108,12 +124,18 @@ vec![0.0; vocab.len()],     // logits
             ff1_bias,
             ff2_weights,
             ff2_bias,
+            output_weights,
+            output_bias,
             temp_buffers,
         }
     }
 
     #[inline(always)]
     pub fn forward_buffered(&self, context: &[usize], h_out: &mut [f32], logits_out: &mut [f32]) {
+        // Validate buffer sizes
+        assert_eq!(h_out.len(), self.hidden_size, "h_out buffer has incorrect size");
+        assert_eq!(logits_out.len(), self.vocab.len(), "logits_out buffer must match vocabulary size");
+        
         // Average the embeddings for the context
         h_out.par_iter_mut().enumerate().for_each(|(i, h)| {
             let mut sum = 0.0f32;
@@ -123,41 +145,48 @@ vec![0.0; vocab.len()],     // logits
             *h = sum / context.len() as f32;
         });
 
+        // Temporary buffer for intermediate results
+        let mut temp = vec![0.0f32; self.hidden_size];
+
         // First feed-forward layer with ReLU
-    {
-        // Flatten the weights matrix for the linear operation
-        let flat_weights: Vec<f32> = self.ff1_weights.iter().flat_map(|v| v.iter().copied()).collect();
-        self.linear_inplace(
-            h_out,
-            &flat_weights,
-            &self.ff1_bias,
-            logits_out,
-        );
-    }
+        {
+            let flat_weights: Vec<f32> = self.ff1_weights.iter().flat_map(|v| v.iter().copied()).collect();
+            self.linear_inplace(
+                h_out,
+                &flat_weights,
+                &self.ff1_bias,
+                &mut temp,
+            );
+        }
 
-    // ReLU activation
-    logits_out.par_iter_mut().for_each(|x| *x = x.max(0.0));
+        // ReLU activation
+        temp.par_iter_mut().for_each(|x| *x = x.max(0.0));
 
-    // Second feed-forward layer
-    {
-        // Flatten the weights matrix for the linear operation
-        let flat_weights: Vec<f32> = self.ff2_weights.iter().flat_map(|v| v.iter().copied()).collect();
-        self.linear_inplace(
-            logits_out,
-            &flat_weights,
-            &self.ff2_bias,
-            h_out,
-        );
-    }
-    
-    // Copy to logits_out for the final output
-    logits_out.copy_from_slice(h_out);
+        // Second feed-forward layer
+        {
+            let flat_weights: Vec<f32> = self.ff2_weights.iter().flat_map(|v| v.iter().copied()).collect();
+            self.linear_inplace(
+                &temp,
+                &flat_weights,
+                &self.ff2_bias,
+                h_out,
+            );
+        }
+        
+        // Apply output projection (hidden_size -> vocab_size)
+        logits_out.par_iter_mut().enumerate().for_each(|(i, out)| {
+            let mut sum = 0.0;
+            for j in 0..self.hidden_size {
+                sum += h_out[j] * self.output_weights[j][i];
+            }
+            *out = sum + self.output_bias[i];
+        });
     }
     
     fn linear_inplace(&self, input: &[f32], weights: &[f32], bias: &[f32], output: &mut [f32]) {
         // Debug information
-        println!("linear_inplace: input.len() = {}, weights.len() = {}, bias.len() = {}, output.len() = {}", 
-                 input.len(), weights.len(), bias.len(), output.len());
+        // println!("linear_inplace: input.len() = {}, weights.len() = {}, bias.len() = {}, output.len() = {}", 
+        //          input.len(), weights.len(), bias.len(), output.len());
         
         // Ensure output length matches bias length
         assert_eq!(output.len(), bias.len(), "Output length must match bias length");
