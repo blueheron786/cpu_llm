@@ -2,14 +2,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use async_stream::stream;
 use futures_util::Stream;
 use futures_util::StreamExt;
 use glob::glob;
 use thiserror::Error;
 use tokio::fs::File;
-use tokio::io::{self, AsyncReadExt};
-use tokio::sync::Semaphore;
+use tokio::io::{self, AsyncReadExt, BufReader};
+use tokio::sync::Mutex;
+
+/// The default chunk size for reading files (1MB)
+const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Error, Debug)]
 pub enum AsyncIoError {
@@ -25,167 +27,82 @@ pub enum AsyncIoError {
     #[error("No files found matching pattern")]
     NoFilesFound,
     
-    #[error("Semaphore error: {0}")]
-    Semaphore(String),
+    #[error("UTF-8 error: {0}")]
+    Utf8Error(#[from] std::str::Utf8Error),
 }
 
-/// Asynchronously reads a file and returns its contents as a String.
-async fn read_file_async(path: &Path) -> Result<String, AsyncIoError> {
+/// Reads a file and returns its contents as a String
+async fn read_file(path: &Path) -> Result<String, AsyncIoError> {
     let mut file = File::open(path).await?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
     Ok(contents)
 }
 
-/// Streams file contents as they're being read, with a configurable concurrency level.
-pub fn stream_files(
-    pattern: &'static str,
-    concurrency: usize,
-) -> impl Stream<Item = Result<(PathBuf, String), AsyncIoError>> + 'static {
-    let pattern = Arc::new(pattern.to_string());
-    
-    stream! {
-        // First, collect all file paths that match the pattern
-        let paths: Vec<_> = match glob(pattern.as_str()) {
-            Ok(paths) => paths.filter_map(Result::ok).collect(),
-            Err(e) => {
-                yield Err(AsyncIoError::from(e));
-                return;
-            }
-        };
-
-        if paths.is_empty() {
-            yield Err(AsyncIoError::NoFilesFound);
-            return;
-        }
-
-        // Process files with the given concurrency level
-        let semaphore = Arc::new(Semaphore::new(concurrency));
-        
-        // Create a stream of file processing tasks
-        let mut tasks = futures::stream::FuturesUnordered::new();
-        
-        // Spawn initial set of tasks up to concurrency limit
-        for path in paths.into_iter().take(concurrency) {
-            let semaphore = semaphore.clone();
-            tasks.push(tokio::spawn(async move {
-                let _permit = semaphore.acquire_owned().await
-                    .map_err(|e| AsyncIoError::Semaphore(e.to_string()))?;
-                let content = read_file_async(&path).await?;
-                Ok((path, content))
-            }));
-        }
-        
-        // Process tasks as they complete
-        while let Some(result) = tasks.next().await {
-            match result {
-                Ok(Ok((path, content))) => {
-                    yield Ok((path, content));
-                }
-                Ok(Err(e)) => {
-                    yield Err(e);
-                }
-                Err(join_err) => {
-                    yield Err(AsyncIoError::Io(io::Error::new(
-                        io::ErrorKind::Other,
-                        join_err.to_string(),
-                    )));
-                }
-            }
-        }
-    }
-}
-
-/// Processes files in chunks and yields cleaned text chunks
+/// Processes files matching the given pattern and yields cleaned text chunks
 pub async fn process_files(
-    pattern: &'static str,
-    chunk_size: usize,
-    concurrency: usize,
-) -> impl Stream<Item = String> + 'static {
-    stream! {
-        let start_time = Instant::now();
-        let mut file_count = 0;
-        let mut total_bytes = 0;
-        let mut current_chunk = String::with_capacity(chunk_size);
-        
-        let mut stream = Box::pin(stream_files(pattern, concurrency));
-        
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok((path, content)) => {
-                    file_count += 1;
-                    total_bytes += content.len();
-                    
-                    // Clean the text
-                    let cleaned = clean_text(&content);
-                    
-                    // Add to current chunk
-                    current_chunk.push_str(&cleaned);
-                    current_chunk.push(' '); // Separate files with space
-                    
-                    // Yield chunks of the desired size, ensuring we don't split UTF-8 characters
-                    while current_chunk.len() >= chunk_size {
-                        // Find the last character boundary before or at chunk_size
-                        let split_point = current_chunk
-                            .char_indices()
-                            .take_while(|&(i, _)| i <= chunk_size)
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        
-                        // Split at the character boundary
-                        let chunk = current_chunk.drain(..split_point).collect::<String>();
-                        if !chunk.is_empty() {
-                            yield chunk;
-                        }
-                    }
-                    
-                    if file_count % 100 == 0 {
-                        let elapsed = start_time.elapsed();
-                        let mbps = (total_bytes as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64();
-                        println!(
-                            "Processed {} files ({} MB, {:.2} MB/s)",
-                            file_count,
-                            total_bytes / 1024 / 1024,
-                            mbps
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error processing file: {}", e);
-                }
-            }
-        }
-        
-        // Yield any remaining data
-        if !current_chunk.is_empty() {
-            yield current_chunk;
-        }
-        
-        let elapsed = start_time.elapsed();
-        let mbps = (total_bytes as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64().max(0.001);
-        println!(
-            "Processed {} files ({} MB, {:.2} MB/s, {:.2?} total)",
-            file_count,
-            total_bytes / 1024 / 1024,
-            mbps,
-            elapsed
-        );
+    pattern: &str,
+) -> Result<Vec<String>, AsyncIoError> {
+    let start_time = Instant::now();
+    let mut results = Vec::new();
+    
+    // Get all matching files
+    let paths: Vec<_> = glob(pattern)?.filter_map(Result::ok).collect();
+    
+    if paths.is_empty() {
+        return Err(AsyncIoError::NoFilesFound);
     }
+    
+    // Process each file
+    for path in paths {
+        let content = read_file(&path).await?;
+        let cleaned = clean_text(&content);
+        results.push(cleaned);
+    }
+    
+    let elapsed = start_time.elapsed();
+    let total_bytes: usize = results.iter().map(|s| s.len()).sum();
+    let mb_processed = total_bytes as f64 / (1024.0 * 1024.0);
+    
+    println!(
+        "Processed {} files ({:.2} MB) in {:.2?}",
+        results.len(),
+        mb_processed,
+        elapsed
+    );
+    
+    Ok(results)
 }
 
-// Clean text by normalizing spaces and lowercasing
-pub(crate) fn clean_text(text: &str) -> String {
+/// Finds a good split point in the text, preferably at whitespace
+fn find_split_point(text: &str, max_len: usize) -> usize {
+    if text.len() <= max_len {
+        return text.len();
+    }
+    
+    // Try to find a whitespace to split at
+    if let Some(pos) = text[..max_len].rfind(|c: char| c.is_whitespace()) {
+        return pos + 1; // Include the whitespace in the first part
+    }
+    
+    // If no whitespace found, split at max_len (may split in the middle of a word)
+    max_len
+}
+
+/// Cleans and normalizes text for processing
+pub fn clean_text(text: &str) -> String {
     let mut cleaned = String::with_capacity(text.len());
     let mut prev_was_space = false;
 
     for c in text.chars() {
+        // Normalize newlines and other whitespace
         let c = match c {
-            '\n' | '\r' => ' ',
-            _ => c.to_ascii_lowercase(),
+            '\n' | '\r' | '\t' | '\u{00A0}' => ' ', // Common whitespace chars
+            _ if c.is_whitespace() => ' ', // Any other whitespace
+            _ => c.to_ascii_lowercase(), // Convert to lowercase
         };
 
-        if c.is_whitespace() {
+        if c == ' ' {
             if !prev_was_space {
                 cleaned.push(' ');
                 prev_was_space = true;
@@ -196,10 +113,5 @@ pub(crate) fn clean_text(text: &str) -> String {
         }
     }
 
-    // Trim trailing space if any
-    if cleaned.ends_with(' ') {
-        cleaned.pop();
-    }
-
-    cleaned
+    cleaned.trim().to_string()
 }
