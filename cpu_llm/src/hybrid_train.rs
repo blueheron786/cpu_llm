@@ -1,6 +1,5 @@
 //! Hybrid tokenizer and training for the CPU LLM
 
-use rand::Rng;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -328,7 +327,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     
     // Create model with the built vocabulary
-    let mut model = TinyRnnModel::new(id_token_map, CONTEXT_SIZE, HIDDEN_SIZE);
+    let model = TinyRnnModel::new(id_token_map, CONTEXT_SIZE, HIDDEN_SIZE);
     
     println!("📚 Processed {} tokens", token_ids.len());
     
@@ -336,7 +335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut chunk_ranges = Vec::new();
     let mut start = 0;
     while start < token_ids.len() {
-        let mut end = (start + 1024).min(token_ids.len());
+        let end = (start + 1024).min(token_ids.len());
         chunk_ranges.push(start..end);
         start = end;
     }
@@ -471,9 +470,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let context = &token_ids[i - CONTEXT_SIZE..i];
                         let target = token_ids[i];
                         
+                        // Skip if target is out of vocabulary
+                        if target >= model.vocab.len() {
+                            continue;
+                        }
+                        
                         // Forward pass
                         let mut h = vec![0.0; model.hidden_size];
                         let mut logits = vec![0.0; model.vocab.len()];
+                        
+                        // Ensure all context tokens are within vocabulary
+                        if context.iter().any(|&id| id >= model.vocab.len()) {
+                            continue;
+                        }
+                        
                         model.forward_buffered(context, &mut h, &mut logits);
                         
                         // Compute softmax and loss
@@ -589,11 +599,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     loss_sum / (end - idx) as f32,
                     eta / 60.0
                 );
-                
-                // Early exit for benchmarking speed
-                if batch_count >= 20 {
-                    std::process::exit(0);
-                }
             }
         }
 

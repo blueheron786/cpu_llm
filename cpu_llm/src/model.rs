@@ -57,7 +57,6 @@ impl TinyRnnModel {
         // Initialize with small random values using He initialization
         let bound = (6.0 / (vocab.len() + hidden_size) as f32).sqrt();
         let dist = Uniform::new(-bound, bound);
-        let mut rng = rand::thread_rng();
 
         // Initialize embedding layer with parallel collection
         let embedding: Vec<Vec<f32>> = (0..vocab.len())
