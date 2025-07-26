@@ -9,6 +9,8 @@ use std::path::Path;
 use std::time::Instant;
 use tokio::runtime::Runtime;
 
+use cpu_llm::model::is_punct;
+
 mod async_io;
 use async_io::process_files;
 
@@ -21,6 +23,7 @@ const HIDDEN_SIZE: usize = 48; // Moderate hidden size for better quality
 const EPOCHS: usize = 5;
 const BATCH_SIZE: usize = 1024; // Further reduced batch size for speed
 const LR: f32 = 0.003;
+const CHUNK_SIZE: usize = 4096; // Size of chunks for parallel processing
 
 // Hybrid tokenizer tokens: either full word or char fallback
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -76,11 +79,17 @@ pub fn hybrid_tokenize(text: &str, word_vocab: &std::collections::HashSet<String
     let mut tokens = Vec::new();
 
     for word in text.split_whitespace() {
-        let (trimmed, suffix) = word.trim_end_matches(|c: char| is_punct(c)).split_at_word_end();
+        let trimmed = word.trim_end_matches(|c: char| is_punct(c));
+        let (core, suffix) = trimmed.split_at_word_end();
 
-        if word_vocab.contains(trimmed) {
+        if word_vocab.contains(core) {
             tokens.push(Token::Word(trimmed.to_string()));
+            // Add any punctuation as separate tokens
+            for ch in suffix.chars() {
+                tokens.push(Token::Char(ch));
+            }
         } else {
+            // If not in vocab, split into individual characters
             for ch in trimmed.chars() {
                 tokens.push(Token::Char(ch));
             }
@@ -92,10 +101,6 @@ pub fn hybrid_tokenize(text: &str, word_vocab: &std::collections::HashSet<String
     }
 
     tokens
-}
-
-fn is_punct(c: char) -> bool {
-    ",.!?;:'\"()[]{}".contains(c)
 }
 
 // helper for splitting word into (core, suffix)
@@ -372,7 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut chunk_ranges = Vec::new();
     let mut start = 0;
     while start < combined_text.len() {
-        let mut end = (start + chunk_size).min(combined_text.len());
+        let mut end = (start + CHUNK_SIZE).min(combined_text.len());
         // Adjust end to land on a char boundary
         while !combined_text.is_char_boundary(end) && end > start {
             end -= 1;
