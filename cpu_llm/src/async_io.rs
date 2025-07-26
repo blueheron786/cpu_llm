@@ -175,31 +175,14 @@ pub async fn process_files(
 }
 
 // Clean text by normalizing spaces and lowercasing
-pub(crate) fn clean_text(text: &str) -> String {
-    let mut cleaned = String::with_capacity(text.len());
-    let mut prev_was_space = false;
-
-    for c in text.chars() {
-        let c = match c {
-            '\n' | '\r' => ' ',
-            _ => c.to_ascii_lowercase(),
-        };
-
-        if c.is_whitespace() {
-            if !prev_was_space {
-                cleaned.push(' ');
-                prev_was_space = true;
+pub fn clean_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_control() {
+                ' ' // strip control chars
+            } else {
+                c
             }
-        } else {
-            cleaned.push(c);
-            prev_was_space = false;
-        }
-    }
-
-    // Trim trailing space if any
-    if cleaned.ends_with(' ') {
-        cleaned.pop();
-    }
-
-    cleaned
+        })
+        .collect::<String>()
 }

@@ -72,18 +72,49 @@ fn build_word_vocab(text: &str, min_freq: usize) -> HashSet<String> {
 }
 
 // Tokenize text hybrid style: words if known, else chars
-fn hybrid_tokenize(text: &str, word_vocab: &HashSet<String>) -> Vec<Token> {
+pub fn hybrid_tokenize(text: &str, word_vocab: &std::collections::HashSet<String>) -> Vec<Token> {
     let mut tokens = Vec::new();
+
     for word in text.split_whitespace() {
-        if word_vocab.contains(word) {
-            tokens.push(Token::Word(word.to_string()));
+        let (trimmed, suffix) = word.trim_end_matches(|c: char| is_punct(c)).split_at_word_end();
+
+        if word_vocab.contains(trimmed) {
+            tokens.push(Token::Word(trimmed.to_string()));
         } else {
-            for ch in word.chars() {
+            for ch in trimmed.chars() {
                 tokens.push(Token::Char(ch));
             }
         }
+
+        for ch in suffix.chars() {
+            tokens.push(Token::Char(ch));
+        }
     }
+
     tokens
+}
+
+fn is_punct(c: char) -> bool {
+    ",.!?;:'\"()[]{}".contains(c)
+}
+
+// helper for splitting word into (core, suffix)
+trait WordSplit {
+    fn split_at_word_end(&self) -> (&str, &str);
+}
+
+impl WordSplit for &str {
+    fn split_at_word_end(&self) -> (&str, &str) {
+        let mut split_idx = self.len();
+        for (i, c) in self.char_indices().rev() {
+            if is_punct(c) {
+                split_idx = i;
+            } else {
+                break;
+            }
+        }
+        self.split_at(split_idx)
+    }
 }
 
 struct TinyRnnModel {
@@ -328,26 +359,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Process files asynchronously with a concurrency of 8 (configurable)
     println!("📁 Loading files asynchronously from data/**/* ...");
-    
-    // Process files in chunks of 1MB with a concurrency of 8
-    let chunk_size = 1_000_000; // 1MB chunks
-    let concurrency = 8; // Number of files to process in parallel
-    
-    // Collect all text content asynchronously
-    let combined_text = {
-        rt.block_on(async {
-            let mut combined = String::new();
-            let stream = process_files("data/**/*", chunk_size, concurrency).await;
-            
-            // Convert the stream of chunks into a single string
-            tokio::pin!(stream);
-            while let Some(chunk) = stream.next().await {
-                combined.push_str(&chunk);
-            }
-            
-            combined
-        })
-    };
+    let combined_text = load_files_sync("data")?;
     
     if combined_text.is_empty() {
         eprintln!("❌ No files found or no content processed");
@@ -629,4 +641,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(()) // Continue execution even if save fails
         }
     }
+}
+
+fn load_files_sync(data_dir: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::fs;
+    use std::path::Path;
+    
+    let mut combined_text = String::new();
+    let data_path = Path::new(data_dir);
+    
+    if !data_path.exists() {
+        return Err(format!("Data directory '{}' does not exist", data_dir).into());
+    }
+    
+    // Walk directory and collect all text files
+    fn visit_dir(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        if dir.is_dir() {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    visit_dir(&path, files)?;
+                } else if let Some(ext) = path.extension() {
+                    // Add file extensions you want to process
+                    if ext == "txt" || ext == "md" || ext == "text" {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    let mut files = Vec::new();
+    visit_dir(data_path, &mut files)?;
+    
+    println!("Found {} files to process", files.len());
+    
+    // Process files in parallel using rayon
+    let file_contents: Vec<String> = files.par_iter()
+        .filter_map(|file_path| {
+            match fs::read_to_string(file_path) {
+                Ok(content) => {
+                    println!("Loaded: {:?} ({} bytes)", file_path, content.len());
+                    Some(clean_text(&content))
+                },
+                Err(e) => {
+                    eprintln!("Warning: Failed to read {:?}: {}", file_path, e);
+                    None
+                }
+            }
+        })
+        .collect();
+    
+    // Combine all content
+    for content in file_contents {
+        combined_text.push_str(&content);
+        combined_text.push(' '); // Add separator
+    }
+    
+    Ok(combined_text)
 }
