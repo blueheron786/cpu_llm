@@ -1,32 +1,50 @@
 # CPU LLM
 
-## :warning: Highly experimental :warning:
+A lightweight, CPU-native language model built from scratch in Rust. Features a custom hybrid tokenizer (word-level backed by character-level fallback), an RNN-based architecture, and multi-threaded training support using Rayon.
 
-LLM built from the ground-up to use CPUs (multiple threads) and CPU RAM instead of GPUs and GPU RAM.
+## Features
 
-Unlike other existing solutions (circa 2025), the aim is not to take GPU-centric models and limit them to work on CPUs; it's to build something from the ground-up that's made to run efficiently on CPUs.
+- ✅ Written entirely in Rust
+- ✅ Hybrid word+char tokenization
+- ✅ Custom RNN architecture
+- ✅ Parallel training using Rayon
+- ✅ Minimal external dependencies
+- ✅ Designed for small-scale, low-resource environments
 
-As of right now, it's optimized to run as fast as possible, while trying to keep memory from being consumed in an unbound manner. It generally stays within 2GB of memory while training, albeit in some places, memory usage increases logarithmetically.
+## Why?
 
-This is a rapidly-changing, highly experimental fun project. Feel free to open a PR and add your personal touch!
+Most LLMs today require GPUs and massive datasets. This project explores how far we can go with simple architectures, hand-crafted logic, and commodity hardware.
 
 ## Usage
 
-- Download TinyStories v2 (training data) and put it in `cpu_llm/data`
-- Drop a bunch of text files into the `data` directory
-- Run `cargo run --release --bin train` to generate the training model using maximum efficiency.
-- Run `cargo run --bin main` to generate text based on a fixed prompt
+```bash
+cargo run --release --bin train
+```
 
-Add your training data files to `data` as plaintext. Feel free to organize it into subfolders as you see fit. Ensure the text files contain plain text, preferably representative of your target language or domain.
+To run inference:
 
-To retrain, simply add/remove files and run the training again.
+```bash
+cargo run --release --bin infer
+```
 
-## Architecture
+## Project Structure
 
-- `hybrid_train.rs`: Entry point, runs training and generates the model using texts in `data`. The hybrid training uses a hybrid tokenizer that uses a character and wordpiece (subword) approach.
-- `main.rs`: Entry point, runs inference (prompt -> response)
-- `model.rs`: It's the model (structure and weights)
-- `io.rs`: Model persistence (save/load weights)
+- src/tokenizer.rs: Hybrid tokenizer
+- src/model.rs: TinyRnnModel definition and logic
+- src/train.rs: Training loop
+- src/infer.rs: Inference code
+- data/: Training corpus
+- output/: Saved models
 
-`train.rs` uses the old, character-based tokenizer. 
+## Requirements
 
+- Rust (latest stable)
+- Dataset in plain text (UTF-8)
+
+## Limitations
+
+- Model can't generate very complex output or long text
+- Tokenizing will probably eat all your RAM while it's running (takes a couple of minutes)
+
+## License
+MIT
