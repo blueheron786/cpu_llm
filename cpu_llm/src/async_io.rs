@@ -123,10 +123,21 @@ pub async fn process_files(
                     current_chunk.push_str(&cleaned);
                     current_chunk.push(' '); // Separate files with space
                     
-                    // Yield chunks of the desired size
+                    // Yield chunks of the desired size, ensuring we don't split UTF-8 characters
                     while current_chunk.len() >= chunk_size {
-                        let chunk = current_chunk.drain(..chunk_size).collect::<String>();
-                        yield chunk;
+                        // Find the last character boundary before or at chunk_size
+                        let split_point = current_chunk
+                            .char_indices()
+                            .take_while(|&(i, _)| i <= chunk_size)
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        
+                        // Split at the character boundary
+                        let chunk = current_chunk.drain(..split_point).collect::<String>();
+                        if !chunk.is_empty() {
+                            yield chunk;
+                        }
                     }
                     
                     if file_count % 100 == 0 {
