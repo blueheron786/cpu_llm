@@ -3,13 +3,11 @@
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use glob::glob;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::runtime::Runtime;
-use cpu_llm::async_io::process_files;
 use cpu_llm::model::TinyRnnModel;
 
 // Hyperparameters
@@ -280,22 +278,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Second pass: tokenize and build final dataset with streaming
     println!("🔠 Tokenizing text...");
-    let token_freq = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
-    let token_ids = Arc::new(Mutex::new(Vec::new()));
+    
+    // Use a temporary file to store token IDs
+    let temp_dir = std::env::temp_dir();
+    let token_file_path = temp_dir.join("cpu_llm_tokens.tmp");
+    let token_file = File::create(&token_file_path)?;
+    let mut token_writer = std::io::BufWriter::new(token_file);
+    
+    // Keep track of token frequencies in memory (this should be manageable)
+    let mut token_freq = HashMap::<String, u64>::new();
+    let mut total_tokens = 0;
     
     // Process files in the same chunked manner
-    let files = glob::glob("data/**/*")?;
+    let files: Vec<_> = glob::glob("data/**/*")?.filter_map(Result::ok).collect();
     
-    for file in files.filter_map(Result::ok) {
+    for file in files {
         if !file.is_file() { continue; }
         
         let file = File::open(&file)?;
         let reader = BufReader::new(file);
         
         for line in reader.lines().filter_map(Result::ok) {
-            let mut local_token_ids = Vec::new();
-            let mut local_token_freq = HashMap::new();
-            
             for word in line.split_whitespace() {
                 if word.is_empty() {
                     continue;
@@ -303,42 +306,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 if word_vocab.contains(word) {
                     // Word is in vocabulary, use as is
-                    *local_token_freq.entry(word.to_string()).or_insert(0) += 1;
-                    local_token_ids.push(word.to_string());
+                    *token_freq.entry(word.to_string()).or_insert(0) += 1;
+                    // Write the word directly to the file
+                    writeln!(&mut token_writer, "{}", word)?;
+                    total_tokens += 1;
                 } else {
                     // Word not in vocabulary, split into characters
                     for ch in word.chars() {
                         let ch_str = ch.to_string();
-                        *local_token_freq.entry(ch_str.clone()).or_insert(0) += 1;
-                        local_token_ids.push(ch_str);
+                        *token_freq.entry(ch_str.clone()).or_insert(0) += 1;
+                        // Write the character to the file
+                        writeln!(&mut token_writer, "{}", ch_str)?;
+                        total_tokens += 1;
                     }
                 }
             }
             
-            // Merge with global frequencies and token IDs
-            let mut global_freq = token_freq.lock().unwrap();
-            for (token, count) in local_token_freq {
-                *global_freq.entry(token).or_insert(0) += count;
+            // Flush periodically to manage memory
+            if total_tokens % 10000 == 0 {
+                token_writer.flush()?;
             }
-            
-            // Add to token IDs
-            let mut ids = token_ids.lock().unwrap();
-            ids.extend(local_token_ids);
         }
     }
     
-    // Convert Arc<Mutex<Vec<String>>> to Vec<String>
-    let token_ids = Arc::try_unwrap(token_ids).unwrap().into_inner()?;
+    // Final flush to ensure all data is written
+    token_writer.flush()?;
     
-    if token_ids.is_empty() {
+    if total_tokens == 0 {
         eprintln!("❌ No tokens found in the processed files");
         std::process::exit(1);
     }
     
-    println!("✅ Tokenization complete. Total tokens: {}", token_ids.len());
+    println!("✅ Tokenization complete. Total tokens: {}", total_tokens);
     
     // Build token to ID mapping
-    let token_freq = token_freq.lock().unwrap();
     let mut token_id_map = HashMap::new();
     let mut id_token_map = Vec::new();
     
@@ -348,23 +349,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     token_id_map.insert("<UNK>".to_string(), 1);
     id_token_map.push("<UNK>".to_string());
     
-    // Add most frequent tokens first
-    let mut sorted_tokens: Vec<_> = token_freq.iter().collect();
-    sorted_tokens.sort_by(|a, b| b.1.cmp(a.1));
+    // Sort tokens by frequency (most frequent first) and build the vocabulary
+    let mut sorted_tokens: Vec<_> = token_freq.into_iter().collect();
+    sorted_tokens.sort_by(|a, b| b.1.cmp(&a.1));
     
+    // Add tokens to vocabulary
     for (token, _) in sorted_tokens {
-        let id = id_token_map.len();
-        token_id_map.insert(token.clone(), id);
-        id_token_map.push(token.clone());
+        if !token_id_map.contains_key(&token) {
+            let id = id_token_map.len();
+            token_id_map.insert(token.clone(), id);
+            id_token_map.push(token);
+        }
     }
     
-    println!("🔢 Built vocabulary of {} tokens", id_token_map.len());
+    println!("📊 Built vocabulary of {} unique tokens", id_token_map.len());
     
-    // Convert token strings to IDs
-    let token_ids: Vec<usize> = token_ids
-        .into_iter()
-        .map(|token| *token_id_map.get(&token).unwrap_or(&1)) // 1 = <UNK>
-        .collect();
+    // Now process the token file to convert tokens to IDs
+    let token_file = File::open(&token_file_path)?;
+    let reader = BufReader::new(token_file);
+    
+    // Create a new file to store token IDs
+    let token_ids_path = temp_dir.join("cpu_llm_token_ids.tmp");
+    let token_ids_file = File::create(&token_ids_path)?;
+    let mut token_ids_writer = BufWriter::new(token_ids_file);
+    
+    let mut token_count = 0;
+    for line in reader.lines() {
+        let token = line?;
+        let id = token_id_map.get(&token).copied().unwrap_or(1); // Default to UNK
+        writeln!(&mut token_ids_writer, "{}", id)?;
+        token_count += 1;
+        
+        if token_count % 100000 == 0 {
+            println!("Processed {} tokens...", token_count);
+            token_ids_writer.flush()?;
+        }
+    }
+    
+    // Final flush
+    token_ids_writer.flush()?;
+    
+    println!("✅ Successfully processed {} tokens", token_count);
+    
+    // Convert token IDs back to a vector for training
+    let token_ids: Vec<usize> = {
+        let file = File::open(&token_ids_path)?;
+        let reader = BufReader::new(file);
+        let mut ids = Vec::with_capacity(total_tokens);
+        
+        for line in reader.lines() {
+            let id: usize = line?.trim().parse().unwrap_or(1); // Default to UNK
+            ids.push(id);
+        }
+        
+        ids
+    };
+    
+    // Print some stats
+    println!("📊 Vocabulary size: {}", id_token_map.len());
+    println!("📊 Total tokens: {}", token_ids.len());
+    
+    // Clean up temporary files
+    std::fs::remove_file(token_file_path)?;
+    std::fs::remove_file(token_ids_path)?;
     
     // Create model with the built vocabulary
     let model = TinyRnnModel::new(id_token_map, CONTEXT_SIZE, HIDDEN_SIZE);

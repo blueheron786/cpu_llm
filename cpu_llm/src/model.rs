@@ -124,51 +124,70 @@ vec![0.0; vocab.len()],     // logits
         });
 
         // First feed-forward layer with ReLU
+    {
+        // Flatten the weights matrix for the linear operation
+        let flat_weights: Vec<f32> = self.ff1_weights.iter().flat_map(|v| v.iter().copied()).collect();
         self.linear_inplace(
             h_out,
-            &self.ff1_weights,
+            &flat_weights,
             &self.ff1_bias,
             logits_out,
         );
+    }
 
-        // ReLU activation
-        logits_out.par_iter_mut().for_each(|x| *x = x.max(0.0));
+    // ReLU activation
+    logits_out.par_iter_mut().for_each(|x| *x = x.max(0.0));
 
-        // Second feed-forward layer
+    // Second feed-forward layer
+    {
+        // Flatten the weights matrix for the linear operation
+        let flat_weights: Vec<f32> = self.ff2_weights.iter().flat_map(|v| v.iter().copied()).collect();
         self.linear_inplace(
             logits_out,
-            &self.ff2_weights,
+            &flat_weights,
             &self.ff2_bias,
             h_out,
         );
-        
-        // Copy to logits_out for the final output
-        logits_out.copy_from_slice(h_out);
     }
     
-    fn linear_inplace(&self, input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
+    // Copy to logits_out for the final output
+    logits_out.copy_from_slice(h_out);
+    }
+    
+    fn linear_inplace(&self, input: &[f32], weights: &[f32], bias: &[f32], output: &mut [f32]) {
         // Debug information
         println!("linear_inplace: input.len() = {}, weights.len() = {}, bias.len() = {}, output.len() = {}", 
                  input.len(), weights.len(), bias.len(), output.len());
         
+        // Ensure output length matches bias length
+        assert_eq!(output.len(), bias.len(), "Output length must match bias length");
+        
+        // Calculate output dimensions
+        let input_size = input.len();
+        let output_size = output.len();
+        
+        // Check weight matrix dimensions (should be input_size × output_size)
+        assert_eq!(
+            weights.len(), 
+            input_size * output_size, 
+            "Weights length must be input_size * output_size"
+        );
+        
+        // Parallel matrix-vector multiplication
         output.par_iter_mut().enumerate().for_each(|(i, out)| {
-            if i >= weights.len() {
-                println!("Index out of bounds: i = {}, weights.len() = {}", i, weights.len());
-                return;
-            }
-            let row = &weights[i];
+            // Calculate the dot product of input and weight column
             let mut sum = 0.0f32;
-            for (j, &w) in row.iter().enumerate() {
-                if j >= input.len() {
-                    println!("Index out of bounds in row access: j = {}, input.len() = {}", j, input.len());
-                    break;
-                }
-                sum += input[j] * w;
+            for j in 0..input_size {
+                let weight_idx = i * input_size + j;
+                sum += input[j] * weights[weight_idx];
             }
+            
+            // Add bias and store result
             if i < bias.len() {
                 *out = sum + bias[i];
             } else {
-                println!("Index out of bounds for bias: i = {}, bias.len() = {}", i, bias.len());
+                println!("Warning: Bias index {} out of bounds (bias.len() = {}). Using sum without bias.", 
+                         i, bias.len());
                 *out = sum;
             }
         });
