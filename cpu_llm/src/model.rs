@@ -1,7 +1,8 @@
 use rand::Rng;
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
-use crate::utils::{relu, softmax, linear, sample};
+use crate::utils::sample;
+use rayon::prelude::*;
 
 #[derive(Serialize, Deserialize)]
 pub struct TinyRnnModel {
@@ -67,7 +68,7 @@ impl TinyRnnModel {
 }
 
 pub fn run_inference(prompt: &str, num_tokens: usize, model: &TinyRnnModel) -> String {
-    let stoi = &model.stoi;
+    let _stoi = &model.stoi;
     let itos = &model.itos;
 
     // Convert prompt chars to token IDs
@@ -76,6 +77,12 @@ pub fn run_inference(prompt: &str, num_tokens: usize, model: &TinyRnnModel) -> S
         .collect();
 
     let mut output = prompt.to_string();
+
+    // Pre-allocate buffers to avoid repeated allocations
+    let mut avg_embed = vec![0.0; model.hidden_size];
+    let mut h_buffer = vec![0.0; model.hidden_size];
+    let mut logits_buffer = vec![0.0; model.vocab_size];
+    let mut probs_buffer = vec![0.0; model.vocab_size];
 
     for _ in 0..num_tokens {
         // Take last CONTEXT_SIZE tokens (or fewer)
@@ -89,27 +96,22 @@ pub fn run_inference(prompt: &str, num_tokens: usize, model: &TinyRnnModel) -> S
             .rev()
             .collect();
 
-        // Average embeddings
-        let mut avg_embed = vec![0.0; model.hidden_size];
-        for &id in &recent {
-            if let Some(embed) = model.embedding.get(id) {
-                for i in 0..model.hidden_size {
-                    avg_embed[i] += embed[i];
-                }
-            }
-        }
+        // Parallel embedding averaging
+        avg_embed.par_iter_mut().enumerate().for_each(|(i, embed_i)| {
+            *embed_i = recent.iter()
+                .filter_map(|&id| model.embedding.get(id))
+                .map(|embed| embed[i])
+                .sum::<f32>() / recent.len().max(1) as f32;
+        });
 
-        let n = recent.len().max(1) as f32;
-        for i in 0..model.hidden_size {
-            avg_embed[i] /= n;
-        }
+        // Parallel forward pass: ReLU(Linear) → Linear → Softmax
+        parallel_linear(&avg_embed, &model.ff1_weights, &model.ff1_bias, &mut h_buffer);
+        h_buffer.par_iter_mut().for_each(|x| *x = x.max(0.0)); // Parallel ReLU
+        
+        parallel_linear(&h_buffer, &model.ff2_weights, &model.ff2_bias, &mut logits_buffer);
+        parallel_softmax(&logits_buffer, &mut probs_buffer);
 
-        // Forward pass: ReLU(Linear) → Linear → Softmax
-        let h = relu(linear(&avg_embed, &model.ff1_weights, &model.ff1_bias));
-        let logits = linear(&h, &model.ff2_weights, &model.ff2_bias);
-        let probs = softmax(logits);
-
-        let next_id = sample(&probs);
+        let next_id = sample(&probs_buffer);
         let next_char = itos.get(next_id).copied().unwrap_or('?');
 
         output.push(next_char);
@@ -117,4 +119,40 @@ pub fn run_inference(prompt: &str, num_tokens: usize, model: &TinyRnnModel) -> S
     }
 
     output
+}
+
+/// Batch inference for maximum parallelization - processes multiple prompts simultaneously
+pub fn run_batch_inference(prompts: &[&str], num_tokens: usize, model: &TinyRnnModel) -> Vec<String> {
+    prompts.par_iter()
+        .map(|&prompt| run_inference(prompt, num_tokens, model))
+        .collect()
+}
+
+/// Parallel linear transformation: output = weights * input + bias
+fn parallel_linear(input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
+    // Initialize with bias in parallel
+    output.par_iter_mut().zip(bias.par_iter()).for_each(|(o, &b)| *o = b);
+    
+    // Parallel matrix multiplication
+    output.par_iter_mut().enumerate().for_each(|(j, out_j)| {
+        *out_j += input.par_iter().enumerate()
+            .map(|(i, &x)| x * weights.get(i).and_then(|row| row.get(j)).unwrap_or(&0.0))
+            .sum::<f32>();
+    });
+}
+
+/// Parallel softmax operation
+fn parallel_softmax(logits: &[f32], output: &mut [f32]) {
+    let max_logit = logits.par_iter().copied().reduce(|| f32::NEG_INFINITY, f32::max);
+    
+    // Parallel exp computation
+    output.par_iter_mut().zip(logits.par_iter()).for_each(|(out, &logit)| {
+        *out = (logit - max_logit).exp();
+    });
+    
+    let sum: f32 = output.par_iter().sum();
+    let sum = sum.max(1e-8);
+    
+    // Parallel normalization
+    output.par_iter_mut().for_each(|x| *x /= sum);
 }

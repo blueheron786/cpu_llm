@@ -23,3 +23,7 @@ path = "src/main.rs"
 [[bin]]
 name = "train"
 path = "src/hybrid_train.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"

@@ -331,11 +331,23 @@ fn save_model(path: &str, model: &TinyRnnModel) -> std::io::Result<()> {
 
 fn main() {
     let output_path = "model.txt";
-    // Set rayon thread count from env (default: all cores)
-    if let Ok(num_threads) = std::env::var("RAYON_NUM_THREADS") {
-        if let Ok(n) = num_threads.parse::<usize>() {
+    
+    // Set rayon thread count to maximum available cores
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(rayon::current_num_threads().max(1));
+    
+    if let Ok(env_threads) = std::env::var("RAYON_NUM_THREADS") {
+        if let Ok(n) = env_threads.parse::<usize>() {
             rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
+            println!("🧵 Using {} threads (from RAYON_NUM_THREADS)", n);
+        } else {
+            rayon::ThreadPoolBuilder::new().num_threads(max_threads).build_global().ok();
+            println!("🧵 Using {} threads (maximum available)", max_threads);
         }
+    } else {
+        rayon::ThreadPoolBuilder::new().num_threads(max_threads).build_global().ok();
+        println!("🧵 Using {} threads (maximum available)", max_threads);
     }
     println!("📁 Loading and concatenating files from data/**/* ...");
     let mut combined_text = String::new();
