@@ -4,12 +4,13 @@ use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::Instant;
+use nalgebra::{DVector, DMatrix};
 
-// Hyperparameters
+// Hyperparameters - Optimized for maximum CPU throughput
 const CONTEXT_SIZE: usize = 6; // Moderate context for better quality
 const HIDDEN_SIZE: usize = 48; // Moderate hidden size for better quality
 const EPOCHS: usize = 5;
-const BATCH_SIZE: usize = 1024; // Further reduced batch size for speed
+const BATCH_SIZE: usize = 2048; // Increased batch size for better parallel efficiency
 const LR: f32 = 0.003;
 
 // Hybrid tokenizer tokens: either full word or char fallback
@@ -159,12 +160,13 @@ impl TinyRnnModel {
                 .sum::<f32>() / context.len() as f32;
         });
 
-        // Parallel linear + ReLU
-        linear_inplace_parallel(h_out, &self.ff1_weights, &self.ff1_bias, logits_out);
-        h_out.par_iter_mut().for_each(|x| *x = x.max(0.0));
+        // First linear layer + ReLU with temporary buffer
+        let mut temp_h = vec![0.0; self.hidden_size];
+        linear_inplace_parallel(h_out, &self.ff1_weights, &self.ff1_bias, &mut temp_h);
+        temp_h.par_iter_mut().for_each(|x| *x = x.max(0.0));
 
-        // Parallel final linear layer
-        linear_inplace_parallel(h_out, &self.ff2_weights, &self.ff2_bias, logits_out);
+        // Final linear layer
+        linear_inplace_parallel(&temp_h, &self.ff2_weights, &self.ff2_bias, logits_out);
     }
 
     // Keep the original forward for compatibility
@@ -209,28 +211,98 @@ fn relu(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| v.max(0.0)).collect()
 }
 
-// Parallel in-place linear operation
+// Ultra-fast optimized linear operation for small to medium matrices
+fn linear_inplace_optimized(input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
+    let input_len = input.len();
+    let output_len = output.len();
+    
+    // Always use direct computation for better cache performance
+    // Copy bias first
+    output.copy_from_slice(bias);
+    
+    // Unrolled inner loop for better performance
+    if input_len <= weights.len() {
+        for (i, &x) in input.iter().enumerate() {
+            if x != 0.0 {
+                let weights_row = &weights[i];
+                let weights_len = weights_row.len().min(output_len);
+                
+                // Process in chunks of 4 for better SIMD utilization
+                let chunks = weights_len / 4;
+                let remainder = weights_len % 4;
+                
+                for chunk_idx in 0..chunks {
+                    let base_idx = chunk_idx * 4;
+                    unsafe {
+                        // Manual unrolling for maximum performance
+                        *output.get_unchecked_mut(base_idx) += x * weights_row.get_unchecked(base_idx);
+                        *output.get_unchecked_mut(base_idx + 1) += x * weights_row.get_unchecked(base_idx + 1);
+                        *output.get_unchecked_mut(base_idx + 2) += x * weights_row.get_unchecked(base_idx + 2);
+                        *output.get_unchecked_mut(base_idx + 3) += x * weights_row.get_unchecked(base_idx + 3);
+                    }
+                }
+                
+                // Handle remainder
+                for j in chunks * 4..weights_len {
+                    output[j] += x * weights_row[j];
+                }
+            }
+        }
+    }
+}
+
+// High-performance parallel linear operation with maximum cache efficiency
 fn linear_inplace_parallel(input: &[f32], weights: &[Vec<f32>], bias: &[f32], output: &mut [f32]) {
-    // Initialize output with bias
-    output.iter_mut().zip(bias.iter()).for_each(|(o, &b)| *o = b);
+    // For small matrices, use optimized direct version
+    if output.len() <= 256 {
+        linear_inplace_optimized(input, weights, bias, output);
+        return;
+    }
+    
+    // Initialize with bias in parallel
+    output.par_iter_mut().zip(bias.par_iter()).for_each(|(o, &b)| *o = b);
 
-    // Split the work into chunks for each thread
-    let chunk_size = std::cmp::max(1, output.len() / rayon::current_num_threads());
-
+    // Use parallel processing for larger matrices with optimal chunk sizes
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = (output.len() + num_threads - 1) / num_threads;
+    
     output.par_chunks_mut(chunk_size)
         .enumerate()
         .for_each(|(chunk_idx, out_chunk)| {
-            let out_start = chunk_idx * chunk_size;
+            let start_idx = chunk_idx * chunk_size;
+            
             for (i, &x) in input.iter().enumerate() {
-                if x == 0.0 { continue; }
-                if out_start >= weights[i].len() { continue; }
-                let end_idx = (out_start + out_chunk.len()).min(weights[i].len());
-                let weights_row = &weights[i][out_start..end_idx];
-                for (out, &w) in out_chunk.iter_mut().take(weights_row.len()).zip(weights_row.iter()) {
-                    *out += x * w;
+                if x == 0.0 || i >= weights.len() { continue; }
+                
+                let weights_row = &weights[i];
+                let end_idx = (start_idx + out_chunk.len()).min(weights_row.len());
+                
+                if start_idx < weights_row.len() {
+                    let weight_slice = &weights_row[start_idx..end_idx];
+                    
+                    // Process in groups of 4 for better SIMD utilization
+                    let chunks = weight_slice.len() / 4;
+                    let remainder = weight_slice.len() % 4;
+                    
+                    for chunk_idx in 0..chunks {
+                        let base_idx = chunk_idx * 4;
+                        if base_idx + 3 < out_chunk.len() {
+                            out_chunk[base_idx] += x * weight_slice[base_idx];
+                            out_chunk[base_idx + 1] += x * weight_slice[base_idx + 1];
+                            out_chunk[base_idx + 2] += x * weight_slice[base_idx + 2];
+                            out_chunk[base_idx + 3] += x * weight_slice[base_idx + 3];
+                        }
+                    }
+                    
+                    // Handle remainder
+                    for j in chunks * 4..weight_slice.len() {
+                        if j < out_chunk.len() {
+                            out_chunk[j] += x * weight_slice[j];
+                        }
+                    }
                 }
             }
-    });
+        });
 }
 
 // Original in-place linear operation for smaller matrices
@@ -511,9 +583,8 @@ fn main() {
         let mut batch_count = 0;
         let total_batches = ((token_ids.len() - 1 - CONTEXT_SIZE) as f64 / BATCH_SIZE as f64).ceil() as usize;
 
-        // Pre-allocate thread-local buffers to avoid repeated allocations
-        // Use a larger chunk size for better parallel efficiency and cache locality
-        let chunk_size = (BATCH_SIZE / rayon::current_num_threads().max(1)).max(256);
+        // Pre-allocate thread-local buffers with optimal sizes for maximum performance
+        let optimal_chunk_size = (BATCH_SIZE / rayon::current_num_threads()).max(1024);
         
         // Gradient accumulation buffers
         let mut accum_grad_w = vec![vec![0.0; model.vocab.len()]; model.hidden_size];
@@ -524,11 +595,16 @@ fn main() {
             let batch_start = Instant::now();
             let end = (idx + BATCH_SIZE).min(token_ids.len() - 1);
 
-            // Process multiple samples per thread using chunked iteration
+            // Optimized parallel batch processing with maximum efficiency
+            let batch_size = end - idx;
+            let threads = rayon::current_num_threads();
+            let samples_per_thread = (batch_size + threads - 1) / threads;
+            let optimal_chunk_size = samples_per_thread.max(128).min(512);
+            
             let (grad_w_sum, grad_b_sum, loss_sum) = (idx..end).into_par_iter()
-                .chunks(chunk_size)
+                .chunks(optimal_chunk_size)
                 .map(|chunk| {
-                    // Thread-local buffers allocated once per chunk
+                    // Pre-allocated thread-local buffers for maximum efficiency
                     let mut grad_w = vec![vec![0.0; model.vocab.len()]; model.hidden_size];
                     let mut grad_b = vec![0.0; model.vocab.len()];
                     let mut loss = 0.0_f32;
@@ -536,27 +612,48 @@ fn main() {
                     let mut logits_buffer = vec![0.0; model.vocab.len()];
                     let mut probs_buffer = vec![0.0; model.vocab.len()];
 
-                    // Reuse buffers for each sample in the chunk
+                    // Optimized sample processing loop
                     for i in chunk {
                         let context = &token_ids[i - CONTEXT_SIZE..i];
                         let target = token_ids[i];
 
+                        // Ultra-fast forward pass
                         model.forward_buffered(context, &mut h_buffer, &mut logits_buffer);
                         softmax_inplace(&mut logits_buffer, &mut probs_buffer);
 
                         let safe_prob = probs_buffer[target].max(1e-8);
                         loss += -safe_prob.ln();
 
+                        // Optimized gradient computation
                         probs_buffer[target] -= 1.0;
+                        
+                        // High-performance gradient accumulation
                         for j in 0..model.hidden_size {
                             let h_j = h_buffer[j];
                             let grad_w_j = &mut grad_w[j];
-                            for (k, &dl_k) in probs_buffer.iter().enumerate() {
-                                grad_w_j[k] += dl_k * h_j;
+                            
+                            // Unrolled loop for better performance
+                            let vocab_len = model.vocab.len();
+                            let chunks = vocab_len / 4;
+                            let remainder = vocab_len % 4;
+                            
+                            for chunk_idx in 0..chunks {
+                                let base_idx = chunk_idx * 4;
+                                grad_w_j[base_idx] += probs_buffer[base_idx] * h_j;
+                                grad_w_j[base_idx + 1] += probs_buffer[base_idx + 1] * h_j;
+                                grad_w_j[base_idx + 2] += probs_buffer[base_idx + 2] * h_j;
+                                grad_w_j[base_idx + 3] += probs_buffer[base_idx + 3] * h_j;
+                            }
+                            
+                            for k in chunks * 4..vocab_len {
+                                grad_w_j[k] += probs_buffer[k] * h_j;
                             }
                         }
-                        grad_b.iter_mut().zip(probs_buffer.iter())
-                            .for_each(|(gb, &dl)| *gb += dl);
+                        
+                        // Fast bias gradient accumulation
+                        for (gb, &dl) in grad_b.iter_mut().zip(probs_buffer.iter()) {
+                            *gb += dl;
+                        }
                     }
 
                     (grad_w, grad_b, loss)
@@ -617,10 +714,7 @@ fn main() {
                     eta / 60.0
                 );
                 
-                // Early exit for benchmarking speed
-                if (batch_count >= 20) {
-                    std::process::exit(0);
-                }
+                // Allow full training for performance measurement
             }
         }
 
